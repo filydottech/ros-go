@@ -16,8 +16,9 @@ type Attribute struct {
 
 // Request is the payload Do and Stream accept. Attributes are sent in slice
 // order, so the wire bytes do not depend on map iteration. Proplist becomes an
-// optional .proplist=a,b word. Every raw Query entry must start with '?' and is
-// sent unchanged, because RouterOS treats query order as significant.
+// optional .proplist=a,b word. Query contains preformed query words, such as
+// those from Expr.Words; every raw entry must start with '?' and is sent
+// unchanged, because RouterOS treats query order as significant.
 type Request struct {
 	Attributes []Attribute
 	Proplist   []string

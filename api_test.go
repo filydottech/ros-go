@@ -22,6 +22,15 @@ var (
 	_ func(*routeros.Client) error                                                                = (*routeros.Client).Err
 	_ func(*routeros.Stream) (routeros.Record, error)                                             = (*routeros.Stream).Recv
 	_ func(*routeros.Stream) error                                                                = (*routeros.Stream).Close
+	_ func(string, string) routeros.Expr                                                          = routeros.Equal
+	_ func(string, string) routeros.Expr                                                          = routeros.LessThan
+	_ func(string, string) routeros.Expr                                                          = routeros.GreaterThan
+	_ func(string) routeros.Expr                                                                  = routeros.Exists
+	_ func(string) routeros.Expr                                                                  = routeros.Absent
+	_ func(routeros.Expr) routeros.Expr                                                           = routeros.Not
+	_ func(routeros.Expr, ...routeros.Expr) routeros.Expr                                         = routeros.And
+	_ func(routeros.Expr, ...routeros.Expr) routeros.Expr                                         = routeros.Or
+	_ func(routeros.Expr) []string                                                                = routeros.Expr.Words
 )
 
 func TestDialRejectsInvalidConfigBeforeConnecting(t *testing.T) {

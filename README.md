@@ -39,12 +39,22 @@ if err != nil {
 }
 defer client.Close()
 
-result, err := client.Do(context.Background(), "/system/identity/print", routeros.Request{})
+request := routeros.Request{
+	Query: routeros.And(
+		routeros.Equal("type", "ether"),
+		routeros.Absent("comment"),
+	).Words(),
+}
+
+result, err := client.Do(context.Background(), "/interface/print", request)
 ```
 
 Every path is valid at runtime; the client ships no command catalogue. A
-request carries ordered `Attribute` values, an optional `Proplist`, and raw
-`Query` words that must start with `?`.
+request carries ordered `Attribute` values, an optional `Proplist`, and ordered
+query words. Build query words with `Equal`, `LessThan`, `GreaterThan`,
+`Exists`, `Absent`, `Not`, `And`, and `Or`; arbitrary field names and values
+remain valid inputs. `Query` also accepts raw words beginning with `?` when a
+caller needs the RouterOS query language directly.
 
 ## Security defaults
 

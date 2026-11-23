@@ -126,14 +126,24 @@ func TestDoReturnsLosslessResult(t *testing.T) {
 	result, err := client.Do(context.Background(), "/interface/print", Request{
 		Attributes: []Attribute{{Name: "detail", Value: ""}},
 		Proplist:   []string{"name", "type"},
-		Query:      []string{"?name=ether1"},
+		Query: And(
+			Equal("name", "ether1"),
+			Absent("disabled"),
+		).Words(),
 	})
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
 	}
 
 	words := <-sent
-	want := []string{"/interface/print", "=detail=", ".proplist=name,type", "?name=ether1"}
+	want := []string{
+		"/interface/print",
+		"=detail=",
+		".proplist=name,type",
+		"?name=ether1",
+		"?-disabled",
+		"?#&",
+	}
 	if len(words) != len(want)+1 {
 		t.Fatalf("sentence = %q, want %d words plus a tag", words, len(want))
 	}
