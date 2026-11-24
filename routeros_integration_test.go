@@ -80,6 +80,61 @@ func TestRouterOSStreamCancellationLeavesConnectionUsable(t *testing.T) {
 	}
 }
 
+func TestRouterOSListenerAllowsConcurrentCommand(t *testing.T) {
+	port, err := strconv.Atoi(os.Getenv("ROS_PORT"))
+	if err != nil {
+		t.Fatal("ROS_PORT must be set to the test router port")
+	}
+	client, err := Dial(context.Background(), Config{
+		Host:      os.Getenv("ROS_HOST"),
+		Port:      port,
+		Username:  os.Getenv("ROS_USER"),
+		Password:  []byte(os.Getenv("ROS_PASSWORD")),
+		Plaintext: true,
+	})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := client.Stream(ctx, "/interface/listen", Request{})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	command := make(chan error, 1)
+	go func() {
+		_, err := client.Do(context.Background(), "/system/identity/print", Request{})
+		command <- err
+	}()
+	select {
+	case err := <-command:
+		if err != nil {
+			t.Fatalf("Do(identity) while listener is active error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Do(identity) did not finish while listener was active")
+	}
+
+	cancel()
+	for {
+		_, err := stream.Recv()
+		if err == nil {
+			continue
+		}
+		var cancelled *CancelledError
+		if !errors.As(err, &cancelled) {
+			t.Fatalf("Recv() after cancellation error = %v, want *CancelledError", err)
+		}
+		break
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() after listener cancellation error = %v", err)
+	}
+}
+
 func TestRouterOSReconnectReplacesConnection(t *testing.T) {
 	port, err := strconv.Atoi(os.Getenv("ROS_PORT"))
 	if err != nil {
