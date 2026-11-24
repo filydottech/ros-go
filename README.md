@@ -278,10 +278,10 @@ The client targets RouterOS 6.43+ because it uses the modern one-message
 The live matrix records only versions exercised by this module's integration
 tests.
 
-| RouterOS image | Transport | Read-only integration |
-| --- | --- | --- |
-| `evilfreelancer/docker-routeros:6.49` | Plaintext native API | PASS |
-| `evilfreelancer/docker-routeros:7.23` | Plaintext native API | PASS |
+| RouterOS image | Transport | Read-only integration | Write integration |
+| --- | --- | --- | --- |
+| `evilfreelancer/docker-routeros:6.49` | Plaintext native API | PASS | PASS |
+| `evilfreelancer/docker-routeros:7.23` | Plaintext native API | PASS | PASS |
 
 Run the unit, race, and documentation-example checks from the module root:
 
