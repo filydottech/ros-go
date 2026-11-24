@@ -226,6 +226,10 @@ func Open(ctx context.Context, opts Options) (*Conn, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("transport: clear deadline: %w", err)
@@ -814,8 +818,18 @@ func login(ctx context.Context, conn net.Conn, opts Options) error {
 	if err := conn.SetDeadline(deadline); err != nil {
 		return fmt.Errorf("transport: login deadline: %w", err)
 	}
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
-	defer stop()
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(callbackDone)
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer func() {
+		// stop does not wait for a callback that already started, but Open must
+		// not clear its cancellation deadline before that callback finishes.
+		if !stop() {
+			<-callbackDone
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}

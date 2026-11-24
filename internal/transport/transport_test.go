@@ -70,6 +70,68 @@ func (c *loginReadBlockConn) release() {
 	c.releaseOnce.Do(func() { close(c.releaseRead) })
 }
 
+type loginCancelRaceConn struct {
+	mu sync.Mutex
+
+	cancel          context.CancelFunc
+	reads           int
+	deadlineCalls   int
+	callbackStarted chan struct{}
+	releaseCallback chan struct{}
+	callbackOnce    sync.Once
+	releaseOnce     sync.Once
+}
+
+func newLoginCancelRaceConn(cancel context.CancelFunc) *loginCancelRaceConn {
+	return &loginCancelRaceConn{
+		cancel:          cancel,
+		callbackStarted: make(chan struct{}),
+		releaseCallback: make(chan struct{}),
+	}
+}
+
+func (c *loginCancelRaceConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	c.reads++
+	firstRead := c.reads == 1
+	c.mu.Unlock()
+	if !firstRead {
+		return 0, io.EOF
+	}
+
+	c.cancel()
+	<-c.callbackStarted
+	return copy(b, testkit.EncodeSentence([]string{"!done"})), nil
+}
+
+func (*loginCancelRaceConn) Write(b []byte) (int, error) { return len(b), nil }
+
+func (c *loginCancelRaceConn) Close() error {
+	c.release()
+	return nil
+}
+
+func (*loginCancelRaceConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
+func (*loginCancelRaceConn) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
+func (c *loginCancelRaceConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *loginCancelRaceConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *loginCancelRaceConn) SetDeadline(time.Time) error {
+	c.mu.Lock()
+	c.deadlineCalls++
+	callback := c.deadlineCalls == 2
+	c.mu.Unlock()
+	if callback {
+		c.callbackOnce.Do(func() { close(c.callbackStarted) })
+		<-c.releaseCallback
+	}
+	return nil
+}
+
+func (c *loginCancelRaceConn) release() {
+	c.releaseOnce.Do(func() { close(c.releaseCallback) })
+}
+
 type fakeServer struct {
 	t       *testing.T
 	conn    net.Conn
@@ -260,6 +322,50 @@ func TestLoginCancellationInterruptsPendingRead(t *testing.T) {
 	}
 	if err := <-returned; err == nil {
 		t.Fatal("login() error = nil after context cancellation")
+	}
+}
+
+func TestOpenWaitsForCancelledLoginDeadlineCallback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newLoginCancelRaceConn(cancel)
+	defer conn.release()
+
+	type openResult struct {
+		conn *Conn
+		err  error
+	}
+	returned := make(chan openResult, 1)
+	go func() {
+		conn, err := Open(ctx, Options{
+			Username:       "alice",
+			Password:       []byte(testPassword),
+			ConnectTimeout: time.Minute,
+			Limits:         wire.DefaultLimits(),
+			Dial: func(context.Context, string) (net.Conn, error) {
+				return conn, nil
+			},
+		})
+		returned <- openResult{conn: conn, err: err}
+	}()
+
+	<-conn.callbackStarted
+	select {
+	case result := <-returned:
+		if result.conn != nil {
+			_ = result.conn.Close()
+		}
+		t.Fatal("Open() returned before the cancelled login callback completed")
+	case <-time.After(time.Second):
+	}
+
+	conn.release()
+	result := <-returned
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("Open() error = %v, want context.Canceled", result.err)
+	}
+	if result.conn != nil {
+		t.Fatal("Open() returned a connection after login context cancellation")
 	}
 }
 
