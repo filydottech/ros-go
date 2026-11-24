@@ -278,10 +278,10 @@ The client targets RouterOS 6.43+ because it uses the modern one-message
 The live matrix records only versions exercised by this module's integration
 tests.
 
-| RouterOS image | Transport | Read-only integration | Write integration |
-| --- | --- | --- | --- |
-| `evilfreelancer/docker-routeros:6.49` | Plaintext native API | PASS | PASS |
-| `evilfreelancer/docker-routeros:7.23` | Plaintext native API | PASS | PASS |
+| RouterOS image | Plaintext read-only | Write CRUD | Verified TLS | Restricted API user |
+| --- | --- | --- | --- | --- |
+| `evilfreelancer/docker-routeros:6.49` | PASS | PASS | PASS | PASS |
+| `evilfreelancer/docker-routeros:7.23` | PASS | PASS | PASS | PASS |
 
 Run the unit, race, and documentation-example checks from the module root:
 
@@ -298,6 +298,26 @@ ROS_HOST=router.example.com ROS_PORT=8728 ROS_USER=api ROS_PASSWORD=... \
   go test -tags=integration -count=1 .
 ```
 
+The verified-TLS test additionally needs the TLS endpoint and a PEM file for
+the CA that signed the router certificate. It uses the normal TLS verification
+path and does not opt into `InsecureSkipVerify`:
+
+```sh
+ROS_TLS_HOST=router.example.com ROS_TLS_PORT=8729 ROS_TLS_CA_FILE=router-ca.pem \
+  ROS_USER=api ROS_PASSWORD=... \
+  go test -tags=integration,integration_tls -count=1 -run '^TestRouterOSTLSWithVerifiedCA$' .
+```
+
+The restricted-user test requires an API user assigned to a dedicated group
+with `read,api` policy. It checks a read-only command and does not attempt a
+mutation:
+
+```sh
+ROS_HOST=router.example.com ROS_PORT=8728 \
+  ROS_RESTRICTED_USER=readonly ROS_RESTRICTED_PASSWORD=... \
+  go test -tags=integration,integration_restricted -count=1 -run '^TestRouterOSRestrictedAPIUserReadsIdentity$' .
+```
+
 The hotspot-user CRUD test requires the additional `integration_write` build
 tag. It creates a uniquely named disabled user, round-trips a UTF-8 comment,
 and removes the user through both the normal path and deferred cleanup. Run it
@@ -308,8 +328,8 @@ ROS_HOST=router.example.com ROS_PORT=8728 ROS_USER=api ROS_PASSWORD=... \
   go test -tags=integration,integration_write -count=1 .
 ```
 
-TLS with a verified private CA and an API account with restricted privileges are
-not yet in the live matrix.
+The TLS and restricted-user checks are opt-in because they require dedicated
+lab provisioning. Do not run the write test against a production router.
 
 ## Go version
 
