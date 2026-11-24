@@ -96,11 +96,15 @@ func newOptions(t *testing.T, script func(*fakeServer)) Options {
 	})
 
 	return Options{
-		Address:        "router.test:8729",
-		Username:       "alice",
-		Password:       []byte(testPassword),
-		ConnectTimeout: 5 * time.Second,
-		Limits:         wire.DefaultLimits(),
+		Address:                "router.test:8729",
+		Username:               "alice",
+		Password:               []byte(testPassword),
+		ConnectTimeout:         5 * time.Second,
+		Limits:                 wire.DefaultLimits(),
+		StreamMaxRecords:       1024,
+		StreamMaxBytes:         8 << 20,
+		MaxBufferedStreamBytes: 64 << 20,
+		MaxOpenStreams:         16,
 		Dial: func(context.Context, string) (net.Conn, error) {
 			return clientConn, nil
 		},
@@ -222,6 +226,178 @@ func TestRoutesInterleavedReplies(t *testing.T) {
 	}
 	if err := conn.Err(); err != nil {
 		t.Fatalf("Err() = %v, want nil", err)
+	}
+}
+
+func TestStreamPauseGateWaitsForEveryFullQueue(t *testing.T) {
+	opts := newOptions(t, func(s *fakeServer) {
+		s.login()
+		s.drain()
+	})
+	opts.StreamMaxRecords = 1
+	conn, err := Open(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	first, err := conn.SubmitStream(context.Background(), []string{"/first/listen"})
+	if err != nil {
+		t.Fatalf("SubmitStream(first) error = %v", err)
+	}
+	second, err := conn.SubmitStream(context.Background(), []string{"/second/listen"})
+	if err != nil {
+		t.Fatalf("SubmitStream(second) error = %v", err)
+	}
+	for _, pending := range []*Pending{first, second} {
+		if err := <-pending.Written(); err != nil {
+			t.Fatalf("stream write error = %v", err)
+		}
+	}
+
+	reply := func(value string) wire.Reply {
+		return wire.Reply{Kind: wire.KindReply, Attributes: map[string]string{"value": value}}
+	}
+	if !conn.deliverStream(first, reply("first")) {
+		t.Fatal("deliverStream(first) returned false")
+	}
+	if !conn.deliverStream(second, reply("second")) {
+		t.Fatal("deliverStream(second) returned false")
+	}
+
+	conn.mu.Lock()
+	if conn.pauseCount != 2 {
+		t.Errorf("pauseCount = %d, want 2 full stream queues", conn.pauseCount)
+	}
+	conn.mu.Unlock()
+
+	if _, err := first.NextStream(); err != nil {
+		t.Fatalf("first NextStream() error = %v", err)
+	}
+	conn.mu.Lock()
+	if conn.pauseCount != 1 {
+		t.Errorf("pauseCount after draining first queue = %d, want 1", conn.pauseCount)
+	}
+	conn.mu.Unlock()
+
+	if _, err := second.NextStream(); err != nil {
+		t.Fatalf("second NextStream() error = %v", err)
+	}
+	conn.mu.Lock()
+	if conn.pauseCount != 0 {
+		t.Errorf("pauseCount after draining both queues = %d, want 0", conn.pauseCount)
+	}
+	conn.mu.Unlock()
+}
+
+func TestStreamAggregateByteBudgetPausesAndDrains(t *testing.T) {
+	opts := newOptions(t, func(s *fakeServer) {
+		s.login()
+		s.drain()
+	})
+	opts.StreamMaxRecords = 2
+	opts.StreamMaxBytes = 4
+	opts.MaxBufferedStreamBytes = 4
+	conn, err := Open(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	first, err := conn.SubmitStream(context.Background(), []string{"/first/listen"})
+	if err != nil {
+		t.Fatalf("SubmitStream(first) error = %v", err)
+	}
+	second, err := conn.SubmitStream(context.Background(), []string{"/second/listen"})
+	if err != nil {
+		t.Fatalf("SubmitStream(second) error = %v", err)
+	}
+	for _, pending := range []*Pending{first, second} {
+		if err := <-pending.Written(); err != nil {
+			t.Fatalf("stream write error = %v", err)
+		}
+	}
+
+	reply := wire.Reply{Kind: wire.KindReply, Attributes: map[string]string{"v": "x"}}
+	if !conn.deliverStream(first, reply) || !conn.deliverStream(second, reply) {
+		t.Fatal("deliverStream() returned false")
+	}
+
+	conn.mu.Lock()
+	if conn.bufferedStreamBytes != 4 {
+		t.Errorf("bufferedStreamBytes = %d, want 4", conn.bufferedStreamBytes)
+	}
+	if !conn.aggregatePaused || conn.pauseCount != 1 {
+		t.Errorf("aggregate pause = %v with count %d, want true with count 1", conn.aggregatePaused, conn.pauseCount)
+	}
+	conn.mu.Unlock()
+
+	if _, err := first.NextStream(); err != nil {
+		t.Fatalf("first NextStream() error = %v", err)
+	}
+	conn.mu.Lock()
+	if conn.bufferedStreamBytes != 2 {
+		t.Errorf("bufferedStreamBytes after drain = %d, want 2", conn.bufferedStreamBytes)
+	}
+	if conn.aggregatePaused || conn.pauseCount != 0 {
+		t.Errorf("aggregate pause after drain = %v with count %d, want false with count 0", conn.aggregatePaused, conn.pauseCount)
+	}
+	conn.mu.Unlock()
+}
+
+func TestCancellingAFullStreamWakesItsReader(t *testing.T) {
+	opts := newOptions(t, func(s *fakeServer) {
+		s.login()
+		command := s.next()
+		tag := tagOf(t, command)
+		cancel := s.next()
+		if len(cancel) != 2 || cancel[0] != "/cancel" || cancel[1] != "=tag="+tag {
+			t.Errorf("cancel sentence = %q, want /cancel =tag=%s", cancel, tag)
+			return
+		}
+		s.send("!done")
+		s.send("!done", ".tag="+tag)
+		s.drain()
+	})
+	opts.StreamMaxRecords = 1
+	conn, err := Open(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	pending, err := conn.SubmitStream(context.Background(), []string{"/interface/listen"})
+	if err != nil {
+		t.Fatalf("SubmitStream() error = %v", err)
+	}
+	if err := <-pending.Written(); err != nil {
+		t.Fatalf("stream write error = %v", err)
+	}
+	if !conn.deliverStream(pending, wire.Reply{Kind: wire.KindReply, Attributes: map[string]string{"value": "full"}}) {
+		t.Fatal("deliverStream() returned false")
+	}
+
+	conn.mu.Lock()
+	if conn.pauseCount != 1 {
+		t.Errorf("pauseCount = %d, want 1 for the full stream", conn.pauseCount)
+	}
+	conn.mu.Unlock()
+
+	cause := errors.New("consumer stopped")
+	wait := conn.Cancel(pending, cause)
+	if _, err := pending.NextStream(); !errors.Is(err, cause) {
+		t.Errorf("NextStream() error = %v, want cancellation cause", err)
+	}
+	conn.mu.Lock()
+	if conn.pauseCount != 0 {
+		t.Errorf("pauseCount after cancellation = %d, want 0", conn.pauseCount)
+	}
+	conn.mu.Unlock()
+
+	select {
+	case <-wait:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not receive its terminal reply")
 	}
 }
 

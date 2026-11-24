@@ -9,8 +9,10 @@ attributes; `!trap` becomes a `*routeros.TrapError` that carries those
 attributes, a command that times out or whose context ends sends `/cancel` and
 returns a `*routeros.TimeoutError` or `*routeros.CancelledError`, and a path
 ending in `/add` without a `ret` in `!done` is a non-fatal
-`*routeros.ProtocolError`. `Stream` and `Reconnect` return a
-`*routeros.ConnectionError`.
+`*routeros.ProtocolError`. `Stream` receives ordered `!re` records through
+`Recv`, returns `io.EOF` for a normal `!done`, and uses bounded queues with TCP
+backpressure; cancelling its context or calling `Close` sends `/cancel`.
+`Reconnect` is not implemented yet and returns a `*routeros.ConnectionError`.
 
 ## Install
 

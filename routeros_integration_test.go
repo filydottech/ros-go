@@ -42,3 +42,40 @@ func TestRouterOSCancellationLeavesConnectionUsable(t *testing.T) {
 		t.Fatalf("Do(identity) after cancellation error = %v", err)
 	}
 }
+
+func TestRouterOSStreamCancellationLeavesConnectionUsable(t *testing.T) {
+	port, err := strconv.Atoi(os.Getenv("ROS_PORT"))
+	if err != nil {
+		t.Fatal("ROS_PORT must be set to the test router port")
+	}
+	client, err := Dial(context.Background(), Config{
+		Host:      os.Getenv("ROS_HOST"),
+		Port:      port,
+		Username:  os.Getenv("ROS_USER"),
+		Password:  []byte(os.Getenv("ROS_PASSWORD")),
+		Plaintext: true,
+	})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := client.Stream(ctx, "/interface/listen", Request{})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	cancel()
+
+	_, err = stream.Recv()
+	var cancelled *CancelledError
+	if !errors.As(err, &cancelled) {
+		t.Fatalf("Recv() error = %v, want *CancelledError", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() after context cancellation error = %v", err)
+	}
+	if _, err := client.Do(context.Background(), "/system/identity/print", Request{}); err != nil {
+		t.Fatalf("Do(identity) after stream cancellation error = %v", err)
+	}
+}

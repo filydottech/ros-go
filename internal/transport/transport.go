@@ -21,6 +21,18 @@ import (
 // locally. The client layer turns it into a *routeros.ClosedError.
 var ErrClosed = errors.New("transport: connection closed")
 
+// LimitError reports a stream resource limit. The client layer turns it into a
+// *routeros.ResourceLimitError.
+type LimitError struct {
+	Scope    string
+	Limit    int64
+	Observed int64
+}
+
+func (e *LimitError) Error() string {
+	return fmt.Sprintf("transport: %s exceeds limit %d (observed %d)", e.Scope, e.Limit, e.Observed)
+}
+
 // LoginTrap reports a !trap reply to the login exchange. Message is the router
 // text and never contains the submitted password.
 type LoginTrap struct {
@@ -55,14 +67,22 @@ type Options struct {
 	CancelGrace time.Duration
 	// Limits bounds the codec in both directions.
 	Limits wire.Limits
+	// StreamMaxRecords and StreamMaxBytes bound one stream's record queue.
+	StreamMaxRecords int
+	StreamMaxBytes   int
+	// MaxBufferedStreamBytes bounds every queued stream record on this
+	// connection together.
+	MaxBufferedStreamBytes int
+	// MaxOpenStreams bounds concurrent stream commands.
+	MaxOpenStreams int
 	// Dial replaces the TCP dialer. Tests use it to supply an in-memory
 	// connection; nil dials Address over TCP.
 	Dial func(ctx context.Context, address string) (net.Conn, error)
 }
 
-// Pending is one submitted sentence awaiting its replies. A reply channel of
-// bounded capacity carries every !re reply addressed to the tag in arrival
-// order, and Done closes once the tag is resolved or the connection ends.
+// Pending is one submitted sentence awaiting its replies. A command uses the
+// bounded Replies channel; a stream uses its bounded queue through NextStream.
+// Done closes once the tag is resolved or the connection ends.
 type Pending struct {
 	tag     string
 	replies chan wire.Reply
@@ -74,9 +94,12 @@ type Pending struct {
 	done    *wire.Reply
 	// cancelled is guarded by Conn.mu. The writer checks it before committing
 	// the sentence to the wire, so a cancellation that wins skips the write.
-	cancelled    bool
-	writeStarted bool
-	graceTimer   *time.Timer
+	cancelled     bool
+	writeStarted  bool
+	graceTimer    *time.Timer
+	stream        *streamQueue
+	cancelledDone chan struct{}
+	cancelOnce    sync.Once
 }
 
 // Tag returns the tag the sentence was sent with.
@@ -125,6 +148,10 @@ func (p *Pending) finish(err error) {
 	})
 }
 
+func (p *Pending) finishCancellation() {
+	p.cancelOnce.Do(func() { close(p.cancelledDone) })
+}
+
 type writeJob struct {
 	sentence []byte
 	ack      chan error
@@ -151,13 +178,23 @@ type Conn struct {
 	pending map[string]*Pending
 	// cancelling holds tags whose caller was already resolved by Cancel. Their
 	// replies are absorbed until !done or the grace period expires.
-	cancelling map[string]struct{}
+	cancelling map[string]*Pending
 	// zombies holds expired or resolved cancellation tags. A late reply for one
 	// is absorbed instead of being reported as desynchronization.
 	zombies    map[string]struct{}
 	grace      time.Duration
 	counter    uint64
 	cancelAcks uint64
+
+	streamMaxRecords       int
+	streamMaxBytes         int
+	maxBufferedStreamBytes int
+	maxOpenStreams         int
+	openStreams            int
+	bufferedStreamBytes    int
+	pauseCount             int
+	aggregatePaused        bool
+	pauseGate              chan struct{}
 
 	terminal error
 
@@ -191,15 +228,20 @@ func Open(ctx context.Context, opts Options) (*Conn, error) {
 	}
 
 	c := &Conn{
-		conn:       conn,
-		limits:     opts.Limits,
-		encoder:    wire.NewEncoder(opts.Limits),
-		pending:    make(map[string]*Pending),
-		cancelling: make(map[string]struct{}),
-		zombies:    make(map[string]struct{}),
-		grace:      opts.CancelGrace,
-		done:       make(chan struct{}),
-		writes:     make(chan *writeJob, writeBuffer),
+		conn:                   conn,
+		limits:                 opts.Limits,
+		encoder:                wire.NewEncoder(opts.Limits),
+		pending:                make(map[string]*Pending),
+		cancelling:             make(map[string]*Pending),
+		zombies:                make(map[string]struct{}),
+		grace:                  opts.CancelGrace,
+		streamMaxRecords:       opts.StreamMaxRecords,
+		streamMaxBytes:         opts.StreamMaxBytes,
+		maxBufferedStreamBytes: opts.MaxBufferedStreamBytes,
+		maxOpenStreams:         opts.MaxOpenStreams,
+		done:                   make(chan struct{}),
+		writes:                 make(chan *writeJob, writeBuffer),
+		pauseGate:              make(chan struct{}),
 	}
 	c.wg.Add(2)
 	go c.readLoop()
@@ -230,6 +272,16 @@ func (c *Conn) Err() error {
 // slice must not already contain a tag: Submit appends one. A sentence whose
 // context has already ended is not registered or sent.
 func (c *Conn) Submit(ctx context.Context, words []string) (*Pending, error) {
+	return c.submit(ctx, words, false)
+}
+
+// SubmitStream registers one long-running sentence with a bounded reply queue.
+// Its returned Pending must be consumed with NextStream.
+func (c *Conn) SubmitStream(ctx context.Context, words []string) (*Pending, error) {
+	return c.submit(ctx, words, true)
+}
+
+func (c *Conn) submit(ctx context.Context, words []string, streaming bool) (*Pending, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -240,13 +292,29 @@ func (c *Conn) Submit(ctx context.Context, words []string) (*Pending, error) {
 		c.mu.Unlock()
 		return nil, err
 	}
+	if streaming {
+		if c.maxOpenStreams < 1 || c.streamMaxRecords < 1 || c.streamMaxBytes < 1 || c.maxBufferedStreamBytes < 1 {
+			c.mu.Unlock()
+			return nil, errors.New("transport: stream limits are not configured")
+		}
+		if c.openStreams >= c.maxOpenStreams {
+			err := &LimitError{Scope: "open streams", Limit: int64(c.maxOpenStreams), Observed: int64(c.openStreams + 1)}
+			c.mu.Unlock()
+			return nil, err
+		}
+	}
 	c.counter++
 	tag := strconv.FormatUint(c.counter, 10)
 	p := &Pending{
-		tag:     tag,
-		replies: make(chan wire.Reply, replyBuffer),
-		acked:   make(chan error, 1),
-		flushed: make(chan struct{}),
+		tag:           tag,
+		replies:       make(chan wire.Reply, replyBuffer),
+		acked:         make(chan error, 1),
+		flushed:       make(chan struct{}),
+		cancelledDone: make(chan struct{}),
+	}
+	if streaming {
+		p.stream = newStreamQueue(c, c.streamMaxRecords, c.streamMaxBytes)
+		c.openStreams++
 	}
 	c.pending[tag] = p
 	c.mu.Unlock()
@@ -276,31 +344,42 @@ func (c *Conn) Submit(ctx context.Context, words []string) (*Pending, error) {
 // is retained as a zombie until !done arrives, so a late reply is absorbed
 // instead of being treated as desynchronization. Cancelling a request that is
 // already resolved does nothing.
-func (c *Conn) Cancel(p *Pending, cause error) {
+func (c *Conn) Cancel(p *Pending, cause error) <-chan struct{} {
 	c.mu.Lock()
 	if _, ok := c.pending[p.tag]; !ok {
+		if _, cancelling := c.cancelling[p.tag]; cancelling {
+			wait := p.cancelledDone
+			c.mu.Unlock()
+			return wait
+		}
+		wait := p.flushed
 		c.mu.Unlock()
-		return
+		return wait
 	}
-	delete(c.pending, p.tag)
+	c.removePendingLocked(p)
 	p.cancelled = true
-	c.cancelling[p.tag] = struct{}{}
+	c.cancelling[p.tag] = p
 	grace := c.grace
 	if grace > 0 {
 		p.graceTimer = time.AfterFunc(grace, func() { c.expireCancel(p.tag) })
+	}
+	if p.stream != nil {
+		p.stream.failLocked(cause)
 	}
 	c.mu.Unlock()
 
 	p.finish(cause)
 	c.sendCancel(p)
+	return p.cancelledDone
 }
 
 func (c *Conn) expireCancel(tag string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.cancelling[tag]; ok {
+	if p, ok := c.cancelling[tag]; ok {
 		delete(c.cancelling, tag)
 		c.zombies[tag] = struct{}{}
+		p.finishCancellation()
 	}
 }
 
@@ -321,13 +400,17 @@ func (c *Conn) forgetUnsentCancel(p *Pending) {
 		p.graceTimer.Stop()
 		p.graceTimer = nil
 	}
+	p.finishCancellation()
 	c.mu.Unlock()
 }
 
 func (c *Conn) discard(p *Pending, err error) {
 	c.mu.Lock()
-	delete(c.pending, p.tag)
+	c.removePendingLocked(p)
 	p.cancelled = true
+	if p.stream != nil {
+		p.stream.failLocked(err)
+	}
 	c.mu.Unlock()
 	p.finish(err)
 	if err == nil {
@@ -342,6 +425,9 @@ func (c *Conn) readLoop() {
 	decoder := wire.NewDecoder(c.limits)
 	buf := make([]byte, readBuffer)
 	for {
+		if !c.waitForReadGate() {
+			return
+		}
 		n, readErr := c.conn.Read(buf)
 		if n > 0 {
 			sentences, err := decoder.Feed(buf[:n])
@@ -391,11 +477,18 @@ func (c *Conn) route(reply wire.Reply) bool {
 	}
 
 	pending := c.pending[reply.Tag]
-	_, cancelling := c.cancelling[reply.Tag]
+	cancellingPending, cancelling := c.cancelling[reply.Tag]
 	_, zombie := c.zombies[reply.Tag]
 	if reply.Kind == wire.KindDone {
 		delete(c.cancelling, reply.Tag)
 		delete(c.zombies, reply.Tag)
+		if cancellingPending != nil {
+			if cancellingPending.graceTimer != nil {
+				cancellingPending.graceTimer.Stop()
+				cancellingPending.graceTimer = nil
+			}
+			cancellingPending.finishCancellation()
+		}
 	}
 	c.mu.Unlock()
 
@@ -412,6 +505,9 @@ func (c *Conn) route(reply wire.Reply) bool {
 func (c *Conn) deliver(p *Pending, reply wire.Reply) bool {
 	switch reply.Kind {
 	case wire.KindReply:
+		if p.stream != nil {
+			return c.deliverStream(p, reply)
+		}
 		select {
 		case p.replies <- reply:
 		case <-p.flushed:
@@ -433,10 +529,50 @@ func (c *Conn) deliver(p *Pending, reply wire.Reply) bool {
 	}
 
 	c.mu.Lock()
-	delete(c.pending, p.tag)
+	c.removePendingLocked(p)
+	if p.stream != nil {
+		p.stream.closeLocked()
+	}
 	c.mu.Unlock()
 	p.finish(nil)
 	return true
+}
+
+func (c *Conn) deliverStream(p *Pending, reply wire.Reply) bool {
+	bytes := streamReplyBytes(reply)
+	queue := p.stream
+	if bytes > queue.maxBytes {
+		c.Cancel(p, &LimitError{Scope: "stream bytes", Limit: int64(queue.maxBytes), Observed: int64(bytes)})
+		return true
+	}
+
+	for {
+		c.mu.Lock()
+		if c.terminal != nil {
+			c.mu.Unlock()
+			return false
+		}
+		if p.cancelled || queue.closed {
+			c.mu.Unlock()
+			return true
+		}
+		if !queue.paused && c.bufferedStreamBytes+bytes <= c.maxBufferedStreamBytes {
+			queue.appendLocked(reply, bytes)
+			c.mu.Unlock()
+			return true
+		}
+		if c.bufferedStreamBytes+bytes > c.maxBufferedStreamBytes {
+			c.setAggregatePausedLocked(true)
+		}
+		gate := c.pauseGate
+		c.mu.Unlock()
+
+		select {
+		case <-gate:
+		case <-c.done:
+			return false
+		}
+	}
 }
 
 func (c *Conn) writeLoop() {
@@ -496,9 +632,20 @@ func (c *Conn) terminate(err error) {
 	}
 	c.terminal = err
 	pending := make([]*Pending, 0, len(c.pending))
-	for tag, p := range c.pending {
+	for _, p := range c.pending {
 		pending = append(pending, p)
-		delete(c.pending, tag)
+		c.removePendingLocked(p)
+		if p.stream != nil {
+			p.stream.failLocked(err)
+		}
+	}
+	cancelling := make([]*Pending, 0, len(c.cancelling))
+	for _, p := range c.cancelling {
+		cancelling = append(cancelling, p)
+		if p.graceTimer != nil {
+			p.graceTimer.Stop()
+			p.graceTimer = nil
+		}
 	}
 	clear(c.cancelling)
 	clear(c.zombies)
@@ -509,9 +656,99 @@ func (c *Conn) terminate(err error) {
 	for _, p := range pending {
 		p.finish(err)
 	}
+	for _, p := range cancelling {
+		p.finishCancellation()
+	}
 	c.closeOnce.Do(func() {
 		_ = c.conn.Close()
 	})
+}
+
+func (c *Conn) removePendingLocked(p *Pending) {
+	if c.pending[p.tag] != p {
+		return
+	}
+	delete(c.pending, p.tag)
+	if p.stream != nil {
+		c.openStreams--
+	}
+}
+
+func (c *Conn) waitForReadGate() bool {
+	for {
+		c.mu.Lock()
+		if c.terminal != nil {
+			c.mu.Unlock()
+			return false
+		}
+		if c.pauseCount == 0 {
+			c.mu.Unlock()
+			return true
+		}
+		gate := c.pauseGate
+		c.mu.Unlock()
+
+		select {
+		case <-gate:
+		case <-c.done:
+			return false
+		}
+	}
+}
+
+func (c *Conn) updateQueuePauseLocked(queue *streamQueue) {
+	if queue.paused {
+		if queue.isDrainedLocked() {
+			c.setQueuePausedLocked(queue, false)
+		}
+		return
+	}
+	if queue.isFullLocked() {
+		c.setQueuePausedLocked(queue, true)
+	}
+}
+
+func (c *Conn) setQueuePausedLocked(queue *streamQueue, paused bool) {
+	if queue.paused == paused {
+		return
+	}
+	queue.paused = paused
+	if paused {
+		c.pauseCount++
+	} else {
+		c.pauseCount--
+	}
+	c.signalPauseLocked()
+}
+
+func (c *Conn) updateAggregatePauseLocked() {
+	if c.aggregatePaused {
+		if c.bufferedStreamBytes <= c.maxBufferedStreamBytes/2 {
+			c.setAggregatePausedLocked(false)
+		}
+		return
+	}
+	if c.bufferedStreamBytes >= c.maxBufferedStreamBytes {
+		c.setAggregatePausedLocked(true)
+	}
+}
+
+func (c *Conn) setAggregatePausedLocked(paused bool) {
+	if c.aggregatePaused == paused {
+		return
+	}
+	c.aggregatePaused = paused
+	if paused {
+		c.pauseCount++
+	} else {
+		c.pauseCount--
+	}
+	c.signalPauseLocked()
+}
+
+func (c *Conn) signalPauseLocked() {
+	close(c.pauseGate)
+	c.pauseGate = make(chan struct{})
 }
 
 func dial(ctx context.Context, opts Options) (net.Conn, error) {

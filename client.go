@@ -1,9 +1,9 @@
 // Package routeros is a RouterOS native API client over TCP and TLS.
 //
 // A Client owns one connection. Requests are tagged and multiplexed, results
-// keep their wire order, and streams are bounded. Dial connects and logs in,
-// and Do runs one command; Stream and Reconnect are not implemented yet, so
-// they return a *ConnectionError. See the README for status.
+// keep their wire order, and streams are bounded. Dial connects and logs in;
+// Do runs one command, Stream receives a long-running command, and Reconnect
+// is not implemented yet.
 package routeros
 
 import (
@@ -21,8 +21,6 @@ import (
 )
 
 var (
-	// errNoStreams marks Stream, whose implementation lands in the stream phase.
-	errNoStreams = errors.New("streams are not implemented yet")
 	// errNoReconnect marks Reconnect, whose implementation lands in the
 	// lifecycle phase.
 	errNoReconnect = errors.New("reconnect is not implemented yet")
@@ -111,6 +109,10 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 			MaxSentenceBytes:    cfg.MaxSentenceBytes,
 			MaxWordsPerSentence: cfg.MaxWordsPerSentence,
 		},
+		StreamMaxRecords:       cfg.StreamMaxRecords,
+		StreamMaxBytes:         cfg.StreamMaxBytes,
+		MaxBufferedStreamBytes: cfg.MaxBufferedStreamBytes,
+		MaxOpenStreams:         cfg.MaxOpenStreams,
 	}
 	if !cfg.Plaintext {
 		options.TLSConfig = cfg.TLSConfig
@@ -261,7 +263,59 @@ drain:
 // !done; a trap, cancellation, peer close, and Close each return a distinct
 // typed error.
 func (c *Client) Stream(ctx context.Context, path string, req Request) (*Stream, error) {
-	return nil, &ConnectionError{Op: "stream", Err: errNoStreams}
+	words, err := req.words(path)
+	if err != nil {
+		return nil, &ConnectionError{Op: "stream", Err: err}
+	}
+
+	c.mu.Lock()
+	conn := c.conn
+	closed := c.closed
+	terminal := c.err
+	timeout := c.cfg.CommandTimeout
+	c.mu.Unlock()
+
+	if closed {
+		return nil, &ClosedError{}
+	}
+	if terminal != nil {
+		return nil, terminal
+	}
+	if conn == nil {
+		return nil, &ConnectionError{Op: "stream", Err: errors.New("client has no connection")}
+	}
+
+	pending, err := conn.SubmitStream(ctx, words)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, &CancelledError{Cause: ctxErr}
+		}
+		return nil, mapTransportError("stream", timeout, err)
+	}
+
+	select {
+	case writeErr := <-pending.Written():
+		if writeErr != nil {
+			<-pending.Done()
+			return nil, mapTransportError("stream", timeout, pending.Err())
+		}
+	case <-ctx.Done():
+		conn.Cancel(pending, ctx.Err())
+		return nil, &CancelledError{Cause: ctx.Err()}
+	case <-pending.Done():
+		select {
+		case writeErr := <-pending.Written():
+			if writeErr != nil {
+				return nil, mapTransportError("stream", timeout, pending.Err())
+			}
+		case <-conn.Done():
+			return nil, mapTransportError("stream", timeout, pending.Err())
+		}
+	}
+
+	stream := newStream(conn, pending, timeout)
+	go stream.watchContext(ctx)
+	return stream, nil
 }
 
 // Reconnect replaces the connection using cfg. It rejects a concurrent
@@ -361,6 +415,10 @@ func mapTransportError(op string, timeout time.Duration, err error) error {
 	var limitErr *wire.LimitError
 	if errors.As(err, &limitErr) {
 		return &ResourceLimitError{Scope: limitErr.Scope, Limit: limitErr.Limit, Observed: limitErr.Observed}
+	}
+	var streamLimit *transport.LimitError
+	if errors.As(err, &streamLimit) {
+		return &ResourceLimitError{Scope: streamLimit.Scope, Limit: streamLimit.Limit, Observed: streamLimit.Observed}
 	}
 	var loginTrap *transport.LoginTrap
 	if errors.As(err, &loginTrap) {
