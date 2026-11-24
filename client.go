@@ -294,7 +294,9 @@ func (c *Client) Stream(ctx context.Context, path string, req Request) (*Stream,
 				return nil, mapTransportError("stream", timeout, pending.Err())
 			}
 		case <-conn.Done():
-			return nil, mapTransportError("stream", timeout, pending.Err())
+			if pending.Err() != nil {
+				return nil, mapTransportError("stream", timeout, pending.Err())
+			}
 		}
 	}
 

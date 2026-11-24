@@ -4,9 +4,153 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/filydottech/ros-go/internal/testkit"
+	"github.com/filydottech/ros-go/internal/transport"
+	"github.com/filydottech/ros-go/internal/wire"
 )
+
+type streamStartupCloseConn struct {
+	mu sync.Mutex
+
+	phase        int
+	writes       int
+	decoder      *wire.Decoder
+	commandReply []byte
+	commandDone  chan struct{}
+	writeRelease chan struct{}
+	eofRead      chan struct{}
+	eofOnce      sync.Once
+}
+
+const (
+	streamStartupLoginReply = iota
+	streamStartupWaitCommand
+	streamStartupCommandReply
+	streamStartupEOF
+)
+
+func newStreamStartupCloseConn() *streamStartupCloseConn {
+	return &streamStartupCloseConn{
+		decoder:      wire.NewDecoder(wire.DefaultLimits()),
+		commandDone:  make(chan struct{}),
+		writeRelease: make(chan struct{}),
+		eofRead:      make(chan struct{}),
+	}
+}
+
+func (c *streamStartupCloseConn) Read(b []byte) (int, error) {
+	for {
+		c.mu.Lock()
+		switch c.phase {
+		case streamStartupLoginReply:
+			c.phase = streamStartupWaitCommand
+			c.mu.Unlock()
+			return copy(b, testkit.EncodeSentence([]string{"!done"})), nil
+		case streamStartupWaitCommand:
+			commandDone := c.commandDone
+			c.mu.Unlock()
+			<-commandDone
+		case streamStartupCommandReply:
+			c.phase = streamStartupEOF
+			reply := c.commandReply
+			c.mu.Unlock()
+			return copy(b, reply), nil
+		case streamStartupEOF:
+			c.eofOnce.Do(func() { close(c.eofRead) })
+			c.mu.Unlock()
+			return 0, io.EOF
+		}
+	}
+}
+
+func (c *streamStartupCloseConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	c.writes++
+	if c.writes == 1 {
+		c.mu.Unlock()
+		return len(b), nil
+	}
+	if c.writes != 2 {
+		c.mu.Unlock()
+		return 0, errors.New("unexpected write")
+	}
+	sentences, err := c.decoder.Feed(b)
+	if err != nil || len(sentences) != 1 {
+		c.mu.Unlock()
+		return 0, errors.New("could not decode stream command")
+	}
+	tag := ""
+	for _, word := range sentences[0] {
+		if len(word) > len(".tag=") && word[:len(".tag=")] == ".tag=" {
+			tag = word[len(".tag="):]
+			break
+		}
+	}
+	if tag == "" {
+		c.mu.Unlock()
+		return 0, errors.New("stream command has no tag")
+	}
+	c.commandReply = testkit.EncodeSentence([]string{"!done", ".tag=" + tag})
+	c.phase = streamStartupCommandReply
+	close(c.commandDone)
+	writeRelease := c.writeRelease
+	c.mu.Unlock()
+	<-writeRelease
+	return len(b), nil
+}
+
+func (*streamStartupCloseConn) Close() error                     { return nil }
+func (*streamStartupCloseConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (*streamStartupCloseConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (*streamStartupCloseConn) SetDeadline(time.Time) error      { return nil }
+func (*streamStartupCloseConn) SetReadDeadline(time.Time) error  { return nil }
+func (*streamStartupCloseConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestStreamDoesNotReturnNilWithoutAnErrorWhenPeerClosesAfterDone(t *testing.T) {
+	conn := newStreamStartupCloseConn()
+	oldOpen := openTransport
+	openTransport = func(ctx context.Context, opts transport.Options) (*transport.Conn, error) {
+		opts.Dial = func(context.Context, string) (net.Conn, error) { return conn, nil }
+		return transport.Open(ctx, opts)
+	}
+	defer func() { openTransport = oldOpen }()
+
+	client, err := Dial(context.Background(), Config{
+		Host:      "router.test",
+		Plaintext: true,
+		Username:  "alice",
+		Password:  []byte(dialTestPassword),
+	})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer func() {
+		close(conn.writeRelease)
+		_ = client.Close()
+	}()
+
+	type streamResult struct {
+		stream *Stream
+		err    error
+	}
+	returned := make(chan streamResult, 1)
+	go func() {
+		stream, err := client.Stream(context.Background(), "/interface/listen", Request{})
+		returned <- streamResult{stream: stream, err: err}
+	}()
+
+	<-conn.eofRead
+	<-client.Done()
+	result := <-returned
+	if result.stream == nil && result.err == nil {
+		t.Fatal("Stream() returned nil stream and nil error after the peer closed")
+	}
+}
 
 func TestStreamYieldsRecordsThenEOF(t *testing.T) {
 	client := dialPlain(t, Config{}, func(r *sentenceReader) {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,60 @@ import (
 )
 
 const testPassword = "not-a-real-password"
+
+type loginReadBlockConn struct {
+	mu sync.Mutex
+
+	deadlines       int
+	readStarted     chan struct{}
+	deadlineUpdated chan struct{}
+	releaseRead     chan struct{}
+	readOnce        sync.Once
+	deadlineOnce    sync.Once
+	releaseOnce     sync.Once
+}
+
+func newLoginReadBlockConn() *loginReadBlockConn {
+	return &loginReadBlockConn{
+		readStarted:     make(chan struct{}),
+		deadlineUpdated: make(chan struct{}),
+		releaseRead:     make(chan struct{}),
+	}
+}
+
+func (c *loginReadBlockConn) Read([]byte) (int, error) {
+	c.readOnce.Do(func() { close(c.readStarted) })
+	<-c.releaseRead
+	return 0, errors.New("test login read released")
+}
+
+func (c *loginReadBlockConn) Write(b []byte) (int, error) { return len(b), nil }
+
+func (c *loginReadBlockConn) Close() error {
+	c.release()
+	return nil
+}
+
+func (*loginReadBlockConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
+func (*loginReadBlockConn) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
+func (c *loginReadBlockConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *loginReadBlockConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *loginReadBlockConn) SetDeadline(time.Time) error {
+	c.mu.Lock()
+	c.deadlines++
+	updated := c.deadlines > 1
+	c.mu.Unlock()
+	if updated {
+		c.deadlineOnce.Do(func() { close(c.deadlineUpdated) })
+		c.release()
+	}
+	return nil
+}
+
+func (c *loginReadBlockConn) release() {
+	c.releaseOnce.Do(func() { close(c.releaseRead) })
+}
 
 type fakeServer struct {
 	t       *testing.T
@@ -175,6 +230,36 @@ func TestLoginSendsNameAndPasswordInOneSentence(t *testing.T) {
 	}
 	if err := conn.Err(); err != nil {
 		t.Fatalf("Err() = %v, want nil", err)
+	}
+}
+
+func TestLoginCancellationInterruptsPendingRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn := newLoginReadBlockConn()
+	returned := make(chan error, 1)
+	go func() {
+		returned <- login(ctx, conn, Options{
+			Username:       "alice",
+			Password:       []byte(testPassword),
+			ConnectTimeout: time.Minute,
+			Limits:         wire.DefaultLimits(),
+		})
+	}()
+
+	<-conn.readStarted
+	cancel()
+
+	select {
+	case <-conn.deadlineUpdated:
+	case <-time.After(time.Second):
+		conn.release()
+		<-returned
+		t.Fatal("cancelling the login context did not interrupt the pending read")
+	}
+	if err := <-returned; err == nil {
+		t.Fatal("login() error = nil after context cancellation")
 	}
 }
 
@@ -955,6 +1040,39 @@ func TestCancelAfterDoneDoesNothing(t *testing.T) {
 	case <-p.Done():
 	default:
 		t.Fatal("pending was reopened by Cancel")
+	}
+}
+
+func TestDoneDeliveredAfterCancellationCompletesCancellation(t *testing.T) {
+	pending := &Pending{
+		tag:           "7",
+		replies:       make(chan wire.Reply, replyBuffer),
+		acked:         make(chan error, 1),
+		flushed:       make(chan struct{}),
+		cancelledDone: make(chan struct{}),
+	}
+	conn := &Conn{
+		pending:    map[string]*Pending{pending.tag: pending},
+		cancelling: make(map[string]*Pending),
+		zombies:    make(map[string]struct{}),
+		writes:     make(chan *writeJob, 1),
+	}
+
+	wait := conn.Cancel(pending, errors.New("caller cancelled"))
+	if !conn.deliver(pending, wire.Reply{Kind: wire.KindDone, HasTag: true, Tag: pending.tag}) {
+		t.Fatal("deliver() = false, want true")
+	}
+
+	select {
+	case <-wait:
+	default:
+		t.Fatal("cancellation wait remained open after the pending !done")
+	}
+	if _, ok := conn.cancelling[pending.tag]; ok {
+		t.Fatal("pending tag remained in cancelling after !done")
+	}
+	if _, ok := conn.zombies[pending.tag]; ok {
+		t.Fatal("pending tag became a zombie after !done")
 	}
 }
 

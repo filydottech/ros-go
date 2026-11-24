@@ -386,6 +386,20 @@ func (c *Conn) Cancel(p *Pending, cause error) <-chan struct{} {
 	return p.cancelledDone
 }
 
+func (c *Conn) completeCancellationLocked(tag string) {
+	p, ok := c.cancelling[tag]
+	delete(c.cancelling, tag)
+	delete(c.zombies, tag)
+	if !ok {
+		return
+	}
+	if p.graceTimer != nil {
+		p.graceTimer.Stop()
+		p.graceTimer = nil
+	}
+	p.finishCancellation()
+}
+
 func (c *Conn) expireCancel(tag string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -490,18 +504,10 @@ func (c *Conn) route(reply wire.Reply) bool {
 	}
 
 	pending := c.pending[reply.Tag]
-	cancellingPending, cancelling := c.cancelling[reply.Tag]
+	_, cancelling := c.cancelling[reply.Tag]
 	_, zombie := c.zombies[reply.Tag]
 	if reply.Kind == wire.KindDone {
-		delete(c.cancelling, reply.Tag)
-		delete(c.zombies, reply.Tag)
-		if cancellingPending != nil {
-			if cancellingPending.graceTimer != nil {
-				cancellingPending.graceTimer.Stop()
-				cancellingPending.graceTimer = nil
-			}
-			cancellingPending.finishCancellation()
-		}
+		c.completeCancellationLocked(reply.Tag)
 	}
 	c.mu.Unlock()
 
@@ -543,6 +549,7 @@ func (c *Conn) deliver(p *Pending, reply wire.Reply) bool {
 
 	c.mu.Lock()
 	c.removePendingLocked(p)
+	c.completeCancellationLocked(p.tag)
 	if p.stream != nil {
 		p.stream.closeLocked()
 	}
@@ -806,6 +813,11 @@ func login(ctx context.Context, conn net.Conn, opts Options) error {
 	}
 	if err := conn.SetDeadline(deadline); err != nil {
 		return fmt.Errorf("transport: login deadline: %w", err)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stop()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	sentence, err := wire.NewEncoder(opts.Limits).Sentence([]string{
