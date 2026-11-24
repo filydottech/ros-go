@@ -21,6 +21,10 @@ import (
 // locally. The client layer turns it into a *routeros.ClosedError.
 var ErrClosed = errors.New("transport: connection closed")
 
+// ErrReconnected reports work displaced because the client replaced this
+// connection generation. The client layer turns it into a *routeros.ReconnectError.
+var ErrReconnected = errors.New("transport: connection replaced by reconnect")
+
 // LimitError reports a stream resource limit. The client layer turns it into a
 // *routeros.ResourceLimitError.
 type LimitError struct {
@@ -253,7 +257,16 @@ func Open(ctx context.Context, opts Options) (*Conn, error) {
 // Every pending request fails with ErrClosed. It is safe to call more than
 // once.
 func (c *Conn) Close() error {
-	c.terminate(ErrClosed)
+	return c.CloseWith(ErrClosed)
+}
+
+// CloseWith ends the connection generation with err and waits for the reader
+// and writer. A nil err is treated as ErrClosed.
+func (c *Conn) CloseWith(err error) error {
+	if err == nil {
+		err = ErrClosed
+	}
+	c.terminate(err)
 	c.wg.Wait()
 	return nil
 }

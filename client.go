@@ -3,7 +3,7 @@
 // A Client owns one connection. Requests are tagged and multiplexed, results
 // keep their wire order, and streams are bounded. Dial connects and logs in;
 // Do runs one command, Stream receives a long-running command, and Reconnect
-// is not implemented yet.
+// replaces a connection generation without replaying work.
 package routeros
 
 import (
@@ -18,12 +18,6 @@ import (
 
 	"github.com/filydottech/ros-go/internal/transport"
 	"github.com/filydottech/ros-go/internal/wire"
-)
-
-var (
-	// errNoReconnect marks Reconnect, whose implementation lands in the
-	// lifecycle phase.
-	errNoReconnect = errors.New("reconnect is not implemented yet")
 )
 
 // openTransport is a test seam. Production always dials over the network.
@@ -68,14 +62,17 @@ func (s State) String() string {
 
 // Client is one RouterOS API connection.
 type Client struct {
-	mu       sync.Mutex
-	cfg      Config
-	state    State
-	conn     *transport.Conn
-	done     chan struct{}
-	doneOnce sync.Once
-	err      error
-	closed   bool
+	mu     sync.Mutex
+	cfg    Config
+	state  State
+	conn   *transport.Conn
+	done   chan struct{}
+	err    error
+	closed bool
+
+	reconnecting    bool
+	reconnectCancel context.CancelFunc
+	reconnectDone   chan struct{}
 }
 
 // Dial validates cfg and opens one TLS or plaintext connection to the router.
@@ -98,29 +95,9 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, &CancelledError{Cause: err}
 	}
 
-	options := transport.Options{
-		Address:        net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
-		Username:       cfg.Username,
-		Password:       cfg.Password,
-		ConnectTimeout: cfg.ConnectTimeout,
-		CancelGrace:    cfg.CancelGrace,
-		Limits: wire.Limits{
-			MaxWordBytes:        cfg.MaxWordBytes,
-			MaxSentenceBytes:    cfg.MaxSentenceBytes,
-			MaxWordsPerSentence: cfg.MaxWordsPerSentence,
-		},
-		StreamMaxRecords:       cfg.StreamMaxRecords,
-		StreamMaxBytes:         cfg.StreamMaxBytes,
-		MaxBufferedStreamBytes: cfg.MaxBufferedStreamBytes,
-		MaxOpenStreams:         cfg.MaxOpenStreams,
-	}
-	if !cfg.Plaintext {
-		options.TLSConfig = cfg.TLSConfig
-	}
-
 	client := newClient(cfg)
 	client.setState(LoggingIn)
-	conn, err := openTransport(ctx, options)
+	conn, err := openTransport(ctx, transportOptions(cfg))
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, &CancelledError{Cause: ctxErr}
@@ -134,7 +111,7 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	client.state = Ready
 	client.mu.Unlock()
 
-	go client.watch(conn, cfg.CommandTimeout)
+	go client.watch(conn, client.done, cfg.CommandTimeout)
 	return client, nil
 }
 
@@ -160,12 +137,16 @@ func (c *Client) Do(ctx context.Context, path string, req Request) (Result, erro
 	c.mu.Lock()
 	conn := c.conn
 	closed := c.closed
+	reconnecting := c.reconnecting
 	terminal := c.err
 	timeout := c.cfg.CommandTimeout
 	c.mu.Unlock()
 
 	if closed {
 		return Result{}, &ClosedError{}
+	}
+	if reconnecting {
+		return Result{}, &ReconnectError{}
 	}
 	if terminal != nil {
 		return Result{}, terminal
@@ -271,12 +252,16 @@ func (c *Client) Stream(ctx context.Context, path string, req Request) (*Stream,
 	c.mu.Lock()
 	conn := c.conn
 	closed := c.closed
+	reconnecting := c.reconnecting
 	terminal := c.err
 	timeout := c.cfg.CommandTimeout
 	c.mu.Unlock()
 
 	if closed {
 		return nil, &ClosedError{}
+	}
+	if reconnecting {
+		return nil, &ReconnectError{}
 	}
 	if terminal != nil {
 		return nil, terminal
@@ -325,13 +310,94 @@ func (c *Client) Stream(ctx context.Context, path string, req Request) (*Stream,
 // A failed reconnect leaves the client closed but retryable. Close during a
 // reconnect cancels the attempt and is final.
 func (c *Client) Reconnect(ctx context.Context, cfg Config) error {
-	if _, err := cfg.normalize(); err != nil {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return &ClosedError{}
+	}
+	if c.reconnecting {
+		c.mu.Unlock()
+		return &ReconnectError{}
+	}
+	c.mu.Unlock()
+
+	cfg, err := cfg.normalize()
+	if err != nil {
 		return &ConnectionError{Op: "reconnect", Err: err}
 	}
 	if err := ctx.Err(); err != nil {
 		return &CancelledError{Cause: err}
 	}
-	return &ConnectionError{Op: "reconnect", Err: errNoReconnect}
+
+	reconnectCtx, cancel := context.WithCancel(ctx)
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		cancel()
+		return &ClosedError{}
+	}
+	if c.reconnecting {
+		c.mu.Unlock()
+		cancel()
+		return &ReconnectError{}
+	}
+	oldConn := c.conn
+	oldDone := c.done
+	reconnectDone := make(chan struct{})
+	c.reconnecting = true
+	c.reconnectCancel = cancel
+	c.reconnectDone = reconnectDone
+	c.state = Reconnecting
+	c.mu.Unlock()
+
+	defer func() {
+		cancel()
+		c.mu.Lock()
+		if c.reconnectDone == reconnectDone {
+			c.reconnecting = false
+			c.reconnectCancel = nil
+			c.reconnectDone = nil
+			close(reconnectDone)
+		}
+		c.mu.Unlock()
+	}()
+
+	if oldConn != nil {
+		_ = oldConn.CloseWith(transport.ErrReconnected)
+		<-oldDone
+	}
+	if c.isClosed() {
+		return &ClosedError{}
+	}
+
+	conn, err := openTransport(reconnectCtx, transportOptions(cfg))
+	if err != nil {
+		if c.isClosed() {
+			return &ClosedError{}
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return c.recordReconnectFailure(&CancelledError{Cause: ctxErr})
+		}
+		return c.recordReconnectFailure(mapTransportError("reconnect", cfg.ConnectTimeout, err))
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return &ClosedError{}
+	}
+	c.conn = conn
+	c.done = make(chan struct{})
+	c.cfg = cfg
+	c.cfg.Password = nil
+	c.err = nil
+	c.state = Ready
+	done := c.done
+	c.mu.Unlock()
+
+	go c.watch(conn, done, cfg.CommandTimeout)
+	return nil
 }
 
 // Close releases the connection. It is final and idempotent: later calls
@@ -345,12 +411,28 @@ func (c *Client) Close() error {
 	c.closed = true
 	c.state = Closing
 	conn := c.conn
+	done := c.done
+	cancel := c.reconnectCancel
+	reconnectDone := c.reconnectDone
 	c.mu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	if conn != nil {
 		_ = conn.Close()
+		<-done
+	} else {
+		close(done)
 	}
-	c.shutdown(&ClosedError{})
+	if reconnectDone != nil {
+		<-reconnectDone
+	}
+
+	c.mu.Lock()
+	c.err = &ClosedError{}
+	c.state = Closed
+	c.mu.Unlock()
 	return nil
 }
 
@@ -377,21 +459,35 @@ func (c *Client) Err() error {
 	return c.err
 }
 
-// watch reports the end of the connection generation on the client.
-func (c *Client) watch(conn *transport.Conn, timeout time.Duration) {
+// watch reports the end of one connection generation on the client.
+func (c *Client) watch(conn *transport.Conn, done chan struct{}, timeout time.Duration) {
 	<-conn.Done()
-	c.shutdown(mapTransportError("connection", timeout, conn.Err()))
+	err := mapTransportError("connection", timeout, conn.Err())
+
+	c.mu.Lock()
+	if c.conn == conn && !c.reconnecting && !c.closed {
+		c.err = err
+		c.state = Closed
+	}
+	close(done)
+	c.mu.Unlock()
 }
 
-// shutdown records the terminal error and closes Done exactly once.
-func (c *Client) shutdown(err error) {
+func (c *Client) isClosed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.err == nil {
-		c.err = err
+	return c.closed
+}
+
+func (c *Client) recordReconnectFailure(err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return &ClosedError{}
 	}
+	c.err = err
 	c.state = Closed
-	c.doneOnce.Do(func() { close(c.done) })
+	return err
 }
 
 func (c *Client) setState(state State) {
@@ -420,6 +516,9 @@ func mapTransportError(op string, timeout time.Duration, err error) error {
 	if errors.As(err, &streamLimit) {
 		return &ResourceLimitError{Scope: streamLimit.Scope, Limit: streamLimit.Limit, Observed: streamLimit.Observed}
 	}
+	if errors.Is(err, transport.ErrReconnected) {
+		return &ReconnectError{}
+	}
 	var loginTrap *transport.LoginTrap
 	if errors.As(err, &loginTrap) {
 		return &LoginError{Message: loginTrap.Message}
@@ -442,4 +541,27 @@ func mapTransportError(op string, timeout time.Duration, err error) error {
 // lifecycle can be tested without a connection.
 func newClient(cfg Config) *Client {
 	return &Client{cfg: cfg, state: Connecting, done: make(chan struct{})}
+}
+
+func transportOptions(cfg Config) transport.Options {
+	options := transport.Options{
+		Address:        net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
+		Username:       cfg.Username,
+		Password:       cfg.Password,
+		ConnectTimeout: cfg.ConnectTimeout,
+		CancelGrace:    cfg.CancelGrace,
+		Limits: wire.Limits{
+			MaxWordBytes:        cfg.MaxWordBytes,
+			MaxSentenceBytes:    cfg.MaxSentenceBytes,
+			MaxWordsPerSentence: cfg.MaxWordsPerSentence,
+		},
+		StreamMaxRecords:       cfg.StreamMaxRecords,
+		StreamMaxBytes:         cfg.StreamMaxBytes,
+		MaxBufferedStreamBytes: cfg.MaxBufferedStreamBytes,
+		MaxOpenStreams:         cfg.MaxOpenStreams,
+	}
+	if !cfg.Plaintext {
+		options.TLSConfig = cfg.TLSConfig
+	}
+	return options
 }

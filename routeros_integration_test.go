@@ -79,3 +79,38 @@ func TestRouterOSStreamCancellationLeavesConnectionUsable(t *testing.T) {
 		t.Fatalf("Do(identity) after stream cancellation error = %v", err)
 	}
 }
+
+func TestRouterOSReconnectReplacesConnection(t *testing.T) {
+	port, err := strconv.Atoi(os.Getenv("ROS_PORT"))
+	if err != nil {
+		t.Fatal("ROS_PORT must be set to the test router port")
+	}
+	cfg := Config{
+		Host:      os.Getenv("ROS_HOST"),
+		Port:      port,
+		Username:  os.Getenv("ROS_USER"),
+		Password:  []byte(os.Getenv("ROS_PASSWORD")),
+		Plaintext: true,
+	}
+	client, err := Dial(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	before := client.Done()
+	if err := client.Reconnect(context.Background(), cfg); err != nil {
+		t.Fatalf("Reconnect() error = %v", err)
+	}
+	select {
+	case <-before:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old client generation did not close")
+	}
+	if got := client.State(); got != Ready {
+		t.Errorf("State() after Reconnect() = %s, want %s", got, Ready)
+	}
+	if _, err := client.Do(context.Background(), "/system/identity/print", Request{}); err != nil {
+		t.Fatalf("Do(identity) after Reconnect() error = %v", err)
+	}
+}

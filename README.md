@@ -12,7 +12,11 @@ ending in `/add` without a `ret` in `!done` is a non-fatal
 `*routeros.ProtocolError`. `Stream` receives ordered `!re` records through
 `Recv`, returns `io.EOF` for a normal `!done`, and uses bounded queues with TCP
 backpressure; cancelling its context or calling `Close` sends `/cancel`.
-`Reconnect` is not implemented yet and returns a `*routeros.ConnectionError`.
+`Reconnect` replaces the current connection generation without replaying a
+command or resubscribing a stream: pending work and work attempted while it is
+in progress return `*routeros.ReconnectError`. A failed reconnect leaves the
+client unavailable for normal work but can be retried explicitly; `Close` is
+final.
 
 ## Install
 
