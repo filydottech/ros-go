@@ -636,6 +636,73 @@ func TestCancelResolvesCallerAndAbsorbsLateReplies(t *testing.T) {
 	}
 }
 
+func TestUntaggedReplyDuringCancellationIsDesynchronization(t *testing.T) {
+	conn := openConn(t, func(s *fakeServer) {
+		s.login()
+		tag := tagOf(t, s.next())
+		cancel := s.next()
+		if len(cancel) != 2 || cancel[0] != "/cancel" || cancel[1] != "=tag="+tag {
+			t.Errorf("cancel sentence = %q, want /cancel =tag=%s", cancel, tag)
+			return
+		}
+		s.send("!re", "=value=unexpected")
+		s.drain()
+	})
+
+	p, err := conn.Submit(context.Background(), []string{"/ping"})
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if err := <-p.Written(); err != nil {
+		t.Fatalf("Written() error = %v", err)
+	}
+	conn.Cancel(p, errors.New("caller went away"))
+
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection remained open after an untagged reply during cancellation")
+	}
+	var protocolErr *wire.ProtocolError
+	if !errors.As(conn.Err(), &protocolErr) || !strings.Contains(protocolErr.Detail, "untagged") {
+		t.Fatalf("connection error = %v, want an untagged protocol error", conn.Err())
+	}
+}
+
+func TestOnlyOneUntaggedDoneIsAcceptedPerCancel(t *testing.T) {
+	conn := openConn(t, func(s *fakeServer) {
+		s.login()
+		tag := tagOf(t, s.next())
+		cancel := s.next()
+		if len(cancel) != 2 || cancel[0] != "/cancel" || cancel[1] != "=tag="+tag {
+			t.Errorf("cancel sentence = %q, want /cancel =tag=%s", cancel, tag)
+			return
+		}
+		s.send("!done")
+		s.send("!done")
+		s.drain()
+	})
+
+	p, err := conn.Submit(context.Background(), []string{"/ping"})
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if err := <-p.Written(); err != nil {
+		t.Fatalf("Written() error = %v", err)
+	}
+	conn.Cancel(p, errors.New("caller went away"))
+
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection remained open after an extra untagged !done")
+	}
+	var protocolErr *wire.ProtocolError
+	if !errors.As(conn.Err(), &protocolErr) || !strings.Contains(protocolErr.Detail, "untagged") {
+		t.Fatalf("connection error = %v, want an untagged protocol error", conn.Err())
+	}
+}
+
 func TestCancelledTagExpiresIntoAZombie(t *testing.T) {
 	opts := newOptions(t, func(s *fakeServer) {
 		s.login()
@@ -715,19 +782,20 @@ func TestCancelAfterDoneDoesNothing(t *testing.T) {
 	}
 }
 
-func TestCancelBeforeWriteSkipsTheSentence(t *testing.T) {
+func TestCancelBeforeWriteSkipsCommandAndCancel(t *testing.T) {
 	release := make(chan struct{})
-	seen := make(chan []string, 2)
+	seen := make(chan [][]string, 1)
 	conn := openConn(t, func(s *fakeServer) {
 		s.login()
 		<-release
-		seen <- s.next()
-		cancel := s.next()
-		seen <- cancel
-		tag := strings.TrimPrefix(cancel[1], "=tag=")
-		s.send("!done")
-		s.send("!done", ".tag="+tag)
+		first := s.next()
 		next := s.next()
+		seen <- [][]string{first, next}
+		s.send("!done", ".tag="+tagOf(t, first))
+		if next[0] == "/cancel" {
+			s.send("!done")
+			next = s.next()
+		}
 		s.send("!done", ".tag="+tagOf(t, next))
 		s.drain()
 	})
@@ -741,6 +809,10 @@ func TestCancelBeforeWriteSkipsTheSentence(t *testing.T) {
 		t.Fatalf("Submit(target) error = %v", err)
 	}
 	conn.Cancel(target, errors.New("caller cancelled before the write"))
+	next, err := conn.Submit(context.Background(), []string{"/system/identity/print"})
+	if err != nil {
+		t.Fatalf("Submit(next) error = %v", err)
+	}
 
 	select {
 	case <-target.Done():
@@ -749,19 +821,17 @@ func TestCancelBeforeWriteSkipsTheSentence(t *testing.T) {
 	}
 	close(release)
 
-	firstWords := <-seen
-	cancelWords := <-seen
+	words := <-seen
+	firstWords, nextWords := words[0], words[1]
 	if got := tagOf(t, firstWords); got != first.Tag() {
 		t.Errorf("first tag = %q, want %q", got, first.Tag())
 	}
-	if len(cancelWords) != 2 || cancelWords[0] != "/cancel" || cancelWords[1] != "=tag="+target.Tag() {
-		t.Fatalf("second sentence = %q, want /cancel for the target tag", cancelWords)
+	if len(nextWords) == 0 || nextWords[0] != "/system/identity/print" {
+		t.Errorf("second sentence = %q, want the next command and no /cancel", nextWords)
+	} else if got := tagOf(t, nextWords); got != next.Tag() {
+		t.Errorf("next tag = %q, want %q", got, next.Tag())
 	}
 
-	next, err := conn.Submit(context.Background(), []string{"/system/identity/print"})
-	if err != nil {
-		t.Fatalf("Submit() after cancellation error = %v", err)
-	}
 	select {
 	case <-next.Done():
 	case <-time.After(5 * time.Second):
@@ -787,7 +857,7 @@ func TestCancelledCommandDoesNotBlockTheReader(t *testing.T) {
 			s.send("!re", "=n=late", ".tag="+tag)
 		}
 		cancel := s.next()
-		if len(cancel) != 2 || cancel[1] != "=tag="+tag {
+		if len(cancel) != 2 || cancel[0] != "/cancel" || cancel[1] != "=tag="+tag {
 			t.Errorf("cancel sentence = %q, want /cancel for %s", cancel, tag)
 			return
 		}

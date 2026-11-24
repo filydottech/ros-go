@@ -74,7 +74,9 @@ type Pending struct {
 	done    *wire.Reply
 	// cancelled is guarded by Conn.mu. The writer checks it before committing
 	// the sentence to the wire, so a cancellation that wins skips the write.
-	cancelled bool
+	cancelled    bool
+	writeStarted bool
+	graceTimer   *time.Timer
 }
 
 // Tag returns the tag the sentence was sent with.
@@ -127,7 +129,8 @@ type writeJob struct {
 	sentence []byte
 	ack      chan error
 	// pending is nil for the client's own /cancel sentence.
-	pending *Pending
+	pending      *Pending
+	cancelTarget *Pending
 }
 
 const (
@@ -151,9 +154,10 @@ type Conn struct {
 	cancelling map[string]struct{}
 	// zombies holds expired or resolved cancellation tags. A late reply for one
 	// is absorbed instead of being reported as desynchronization.
-	zombies map[string]struct{}
-	grace   time.Duration
-	counter uint64
+	zombies    map[string]struct{}
+	grace      time.Duration
+	counter    uint64
+	cancelAcks uint64
 
 	terminal error
 
@@ -282,13 +286,13 @@ func (c *Conn) Cancel(p *Pending, cause error) {
 	p.cancelled = true
 	c.cancelling[p.tag] = struct{}{}
 	grace := c.grace
+	if grace > 0 {
+		p.graceTimer = time.AfterFunc(grace, func() { c.expireCancel(p.tag) })
+	}
 	c.mu.Unlock()
 
 	p.finish(cause)
-	if grace > 0 {
-		time.AfterFunc(grace, func() { c.expireCancel(p.tag) })
-	}
-	c.sendCancel(p.tag)
+	c.sendCancel(p)
 }
 
 func (c *Conn) expireCancel(tag string) {
@@ -300,17 +304,24 @@ func (c *Conn) expireCancel(tag string) {
 	}
 }
 
-// sendCancel writes a tagless /cancel sentence. Its own !done reply is
-// untagged, which route tolerates only while a cancellation is in progress.
-func (c *Conn) sendCancel(tag string) {
-	sentence, err := c.encoder.Sentence([]string{"/cancel", "=tag=" + tag})
-	if err != nil {
-		return
-	}
+// sendCancel queues a tagless /cancel sentence. Its untagged !done is counted
+// separately from replies for the command being cancelled.
+func (c *Conn) sendCancel(p *Pending) {
 	select {
-	case c.writes <- &writeJob{sentence: sentence, ack: make(chan error, 1)}:
+	case c.writes <- &writeJob{ack: make(chan error, 1), cancelTarget: p}:
 	case <-c.done:
 	}
+}
+
+func (c *Conn) forgetUnsentCancel(p *Pending) {
+	c.mu.Lock()
+	delete(c.cancelling, p.tag)
+	delete(c.zombies, p.tag)
+	if p.graceTimer != nil {
+		p.graceTimer.Stop()
+		p.graceTimer = nil
+	}
+	c.mu.Unlock()
 }
 
 func (c *Conn) discard(p *Pending, err error) {
@@ -367,9 +378,12 @@ func (c *Conn) route(reply wire.Reply) bool {
 
 	c.mu.Lock()
 	if !reply.HasTag {
-		allowed := len(c.cancelling) > 0
+		isCancelAck := reply.Kind == wire.KindDone && c.cancelAcks > 0
+		if isCancelAck {
+			c.cancelAcks--
+		}
 		c.mu.Unlock()
-		if allowed {
+		if isCancelAck {
 			return true
 		}
 		c.terminate(&wire.ProtocolError{Detail: fmt.Sprintf("untagged %s reply", reply.Kind)})
@@ -431,14 +445,36 @@ func (c *Conn) writeLoop() {
 	for {
 		select {
 		case job := <-c.writes:
-			c.mu.Lock()
-			abandoned := job.pending != nil && job.pending.cancelled
-			c.mu.Unlock()
-			if abandoned {
-				// The caller already has its cancellation result and no
-				// acknowledgement is owed, so a cancelled mutation never
-				// reaches the router.
-				continue
+			if job.pending != nil {
+				c.mu.Lock()
+				abandoned := job.pending.cancelled
+				if !abandoned {
+					job.pending.writeStarted = true
+				}
+				c.mu.Unlock()
+				if abandoned {
+					// The caller already has its cancellation result and no
+					// acknowledgement is owed, so a cancelled mutation never
+					// reaches the router.
+					continue
+				}
+			}
+			if job.cancelTarget != nil {
+				c.mu.Lock()
+				sent := job.cancelTarget.writeStarted
+				c.mu.Unlock()
+				if !sent {
+					c.forgetUnsentCancel(job.cancelTarget)
+					continue
+				}
+				sentence, err := c.encoder.Sentence([]string{"/cancel", "=tag=" + job.cancelTarget.tag})
+				if err != nil {
+					continue
+				}
+				job.sentence = sentence
+				c.mu.Lock()
+				c.cancelAcks++
+				c.mu.Unlock()
 			}
 			err := writeFull(c.conn, job.sentence)
 			job.ack <- err
@@ -466,6 +502,7 @@ func (c *Conn) terminate(err error) {
 	}
 	clear(c.cancelling)
 	clear(c.zombies)
+	c.cancelAcks = 0
 	close(c.done)
 	c.mu.Unlock()
 
