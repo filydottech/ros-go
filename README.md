@@ -2,15 +2,15 @@
 
 A RouterOS native API client for Go, over TCP and TLS.
 
-**Status: Phase 3.** `Dial` connects over TLS or plaintext, verifies the
-certificate, and logs in with one `/login` message, the modern RouterOS API
-login used since 6.43. `Do` runs one command and returns every record in wire
-order with the final `!done` attributes; `!trap` becomes a `*routeros.TrapError`
-that carries those attributes, a command that times out or whose context ends
-sends `/cancel` and returns a `*routeros.TimeoutError` or
-`*routeros.CancelledError`, and a path ending in `/add` without a `ret` in
-`!done` is a non-fatal `*routeros.ProtocolError`. `Stream` and `Reconnect` are
-not implemented yet and return a `*routeros.ConnectionError`.
+`Dial` connects over TLS or plaintext, verifies the certificate, and logs in
+with one `/login` message, the modern RouterOS API login used since 6.43. `Do`
+runs one command and returns every record in wire order with the final `!done`
+attributes; `!trap` becomes a `*routeros.TrapError` that carries those
+attributes, a command that times out or whose context ends sends `/cancel` and
+returns a `*routeros.TimeoutError` or `*routeros.CancelledError`, and a path
+ending in `/add` without a `ret` in `!done` is a non-fatal
+`*routeros.ProtocolError`. `Stream` and `Reconnect` return a
+`*routeros.ConnectionError`.
 
 ## Install
 
