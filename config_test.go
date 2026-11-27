@@ -54,6 +54,20 @@ func TestNormalizeAppliesDefaults(t *testing.T) {
 	}
 }
 
+func TestNormalizeAppliesResultLimits(t *testing.T) {
+	cfg, err := Config{Host: "router.example.com"}.normalize()
+	if err != nil {
+		t.Fatalf("normalize() error = %v", err)
+	}
+
+	if cfg.MaxResultRecords != defaultMaxResultRecords {
+		t.Errorf("MaxResultRecords = %d, want %d", cfg.MaxResultRecords, defaultMaxResultRecords)
+	}
+	if cfg.MaxResultBytes != defaultMaxResultBytes {
+		t.Errorf("MaxResultBytes = %d, want %d", cfg.MaxResultBytes, defaultMaxResultBytes)
+	}
+}
+
 func TestNormalizePlaintextDefaultsToPlaintextPort(t *testing.T) {
 	cfg, err := Config{Host: "router.example.com", Plaintext: true}.normalize()
 	if err != nil {
@@ -124,6 +138,8 @@ func TestNormalizeRejectsInvalidConfig(t *testing.T) {
 		{"port above range", Config{Host: "router.example.com", Port: 65536}, "outside 0..65535"},
 		{"negative connect timeout", Config{Host: "router.example.com", ConnectTimeout: -time.Second}, "must not be negative"},
 		{"negative word limit", Config{Host: "router.example.com", MaxWordBytes: -1}, "must not be negative"},
+		{"negative result record limit", Config{Host: "router.example.com", MaxResultRecords: -1}, "must not be negative"},
+		{"negative result byte limit", Config{Host: "router.example.com", MaxResultBytes: -1}, "must not be negative"},
 		{"stream bytes above connection budget", Config{
 			Host:                   "router.example.com",
 			StreamMaxBytes:         defaultMaxBufferedStreamBytes + 1,

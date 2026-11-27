@@ -22,6 +22,8 @@ const (
 	defaultStreamMaxBytes         = 8 << 20
 	defaultMaxBufferedStreamBytes = 64 << 20
 	defaultMaxOpenStreams         = 16
+	defaultMaxResultRecords       = defaultStreamMaxRecords
+	defaultMaxResultBytes         = defaultStreamMaxBytes
 )
 
 // Config holds every setting Dial and Reconnect use.
@@ -66,6 +68,10 @@ type Config struct {
 	// MaxWordsPerSentence bounds a sentence made of many small words. Zero
 	// selects 4096.
 	MaxWordsPerSentence int
+	// MaxResultRecords and MaxResultBytes bound the records retained by one Do
+	// call. Zero selects 1024 records and 8 MiB of attribute payload.
+	MaxResultRecords int
+	MaxResultBytes   int
 
 	// StreamMaxRecords and StreamMaxBytes bound one stream's queue. Zero
 	// selects 1024 records and 8 MiB.
@@ -115,6 +121,8 @@ func (c Config) normalize() (Config, error) {
 		{"max word bytes", &c.MaxWordBytes, defaultMaxWordBytes},
 		{"max sentence bytes", &c.MaxSentenceBytes, defaultMaxSentenceBytes},
 		{"max words per sentence", &c.MaxWordsPerSentence, defaultMaxWordsPerSentence},
+		{"max result records", &c.MaxResultRecords, defaultMaxResultRecords},
+		{"max result bytes", &c.MaxResultBytes, defaultMaxResultBytes},
 		{"stream max records", &c.StreamMaxRecords, defaultStreamMaxRecords},
 		{"stream max bytes", &c.StreamMaxBytes, defaultStreamMaxBytes},
 		{"max buffered stream bytes", &c.MaxBufferedStreamBytes, defaultMaxBufferedStreamBytes},

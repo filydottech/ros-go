@@ -167,6 +167,122 @@ func TestDoReturnsLosslessResult(t *testing.T) {
 	}
 }
 
+func TestDoReturnsResourceLimitAtResultRecordLimit(t *testing.T) {
+	releaseDone := make(chan struct{})
+	doneSent := make(chan struct{})
+	client := dialPlain(t, Config{MaxResultRecords: 1}, func(r *sentenceReader) {
+		tag := r.tag(r.next())
+		r.send("!re", "=name=ether1", ".tag="+tag)
+		r.send("!re", "=name=ether2", ".tag="+tag)
+		<-releaseDone
+		r.send("!done", ".tag="+tag)
+		close(doneSent)
+		r.drain()
+	})
+
+	_, err := client.Do(context.Background(), "/interface/print", Request{})
+	var limit *ResourceLimitError
+	if !errors.As(err, &limit) {
+		t.Fatalf("Do() error = %v, want *ResourceLimitError", err)
+	}
+	if limit.Scope != "result records" {
+		t.Errorf("Scope = %q, want %q", limit.Scope, "result records")
+	}
+	if limit.Limit != 1 || limit.Observed != 2 {
+		t.Errorf("limit = %+v, want limit 1 and observed 2", limit)
+	}
+	close(releaseDone)
+	<-doneSent
+}
+
+func TestDoCancelsAtResultRecordLimitAndKeepsConnectionUsable(t *testing.T) {
+	client := dialPlain(t, Config{MaxResultRecords: 1}, func(r *sentenceReader) {
+		tag := r.tag(r.next())
+		r.send("!re", "=name=ether1", ".tag="+tag)
+		r.send("!re", "=name=ether2", ".tag="+tag)
+
+		next := r.next()
+		if len(next) != 2 || next[0] != "/cancel" || next[1] != "=tag="+tag {
+			t.Errorf("sentence after result limit = %q, want /cancel =tag=%s", next, tag)
+			r.send("!done", ".tag="+tag)
+			r.send("!done", ".tag="+r.tag(next))
+			r.drain()
+			return
+		}
+		r.send("!done")
+		r.send("!done", ".tag="+tag)
+
+		followup := r.next()
+		r.send("!done", ".tag="+r.tag(followup))
+		r.drain()
+	})
+
+	_, err := client.Do(context.Background(), "/interface/print", Request{})
+	var limit *ResourceLimitError
+	if !errors.As(err, &limit) {
+		t.Fatalf("Do() error = %v, want *ResourceLimitError", err)
+	}
+
+	if _, err := client.Do(context.Background(), "/system/resource/print", Request{}); err != nil {
+		t.Fatalf("Do() after result limit = %v, want a usable connection", err)
+	}
+}
+
+func TestDoAppliesDefaultResultRecordLimit(t *testing.T) {
+	cancelRead := make(chan struct{})
+	serverDone := make(chan struct{})
+	client := dialPlain(t, Config{}, func(r *sentenceReader) {
+		tag := r.tag(r.next())
+		for range defaultMaxResultRecords + 1 {
+			r.send("!re", "=name=ether1", ".tag="+tag)
+		}
+		cancel := r.next()
+		if len(cancel) != 2 || cancel[0] != "/cancel" || cancel[1] != "=tag="+tag {
+			t.Errorf("sentence after default result limit = %q, want /cancel =tag=%s", cancel, tag)
+			close(cancelRead)
+			close(serverDone)
+			return
+		}
+		close(cancelRead)
+		r.send("!done")
+		r.send("!done", ".tag="+tag)
+		close(serverDone)
+		r.drain()
+	})
+
+	_, err := client.Do(context.Background(), "/interface/print", Request{})
+	var limit *ResourceLimitError
+	if !errors.As(err, &limit) {
+		t.Fatalf("Do() error = %v, want *ResourceLimitError", err)
+	}
+	if limit.Limit != int64(defaultMaxResultRecords) || limit.Observed != int64(defaultMaxResultRecords+1) {
+		t.Errorf("limit = %+v, want limit %d and observed %d", limit, defaultMaxResultRecords, defaultMaxResultRecords+1)
+	}
+	<-cancelRead
+	<-serverDone
+}
+
+func TestDoReturnsResourceLimitAtResultByteLimit(t *testing.T) {
+	client := dialPlain(t, Config{MaxResultRecords: 10, MaxResultBytes: 5}, func(r *sentenceReader) {
+		tag := r.tag(r.next())
+		r.send("!re", "=name=xx", ".tag="+tag)
+		r.send("!done", ".tag="+tag)
+		r.drain()
+	})
+
+	_, err := client.Do(context.Background(), "/interface/print", Request{})
+	var limit *ResourceLimitError
+	if !errors.As(err, &limit) {
+		t.Fatalf("Do() error = %v, want *ResourceLimitError", err)
+	}
+	if limit.Scope != "result bytes" {
+		t.Errorf("Scope = %q, want %q", limit.Scope, "result bytes")
+	}
+	if limit.Limit != 5 || limit.Observed != 6 {
+		t.Errorf("limit = %+v, want limit 5 and observed 6", limit)
+	}
+}
+
 func TestDoReportsTrapWithDoneAttributes(t *testing.T) {
 	client := dialPlain(t, Config{}, func(r *sentenceReader) {
 		tag := r.tag(r.next())

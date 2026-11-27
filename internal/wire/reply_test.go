@@ -62,6 +62,19 @@ func TestParseReplyAttributes(t *testing.T) {
 	}
 }
 
+func TestReplyAttributeBytes(t *testing.T) {
+	reply := Reply{
+		Attributes: map[string]string{
+			"name":    "ether1",
+			"comment": "test",
+		},
+	}
+
+	if got, want := ReplyAttributeBytes(reply), len("name")+len("ether1")+len("comment")+len("test"); got != want {
+		t.Errorf("ReplyAttributeBytes() = %d, want %d", got, want)
+	}
+}
+
 func TestParseReplyTreatsEmptyTagAsUntagged(t *testing.T) {
 	reply, err := ParseReply([]string{"!done", ".tag="})
 	if err != nil {

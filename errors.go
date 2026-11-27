@@ -120,8 +120,9 @@ func (e *CancelledError) Unwrap() error { return e.Cause }
 // Is reports whether target is any *CancelledError.
 func (*CancelledError) Is(target error) bool { _, ok := target.(*CancelledError); return ok }
 
-// ResourceLimitError reports a decoder or queue limit that was exceeded.
-// Scope names the limit, for example "word", "sentence", or "stream records".
+// ResourceLimitError reports a decoder, result, or queue limit that was
+// exceeded. Scope names the limit, for example "word", "result bytes", or
+// "stream records".
 type ResourceLimitError struct {
 	Scope    string
 	Limit    int64

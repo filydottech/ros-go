@@ -5,8 +5,8 @@ package routeros
 // coerced here.
 type Record map[string]string
 
-// Result is one completed command. Records preserves the arrival order of
-// every !re reply, and Done holds the attributes of the terminating !done.
+// Result is one completed command. Records preserves the arrival order of the
+// retained !re replies, and Done holds the attributes of the terminating !done.
 type Result struct {
 	Records []Record
 	Done    Record

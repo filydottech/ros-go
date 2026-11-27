@@ -4,11 +4,13 @@ A RouterOS native API client for Go, over TCP and TLS.
 
 `Dial` connects over TLS or plaintext, verifies the certificate, and logs in
 with one `/login` message, the modern RouterOS API login used since 6.43. `Do`
-runs one command and returns every record in wire order with the final `!done`
-attributes; `!trap` becomes a `*routeros.TrapError` that carries those
-attributes, a command that times out or whose context ends sends `/cancel` and
-returns a `*routeros.TimeoutError` or `*routeros.CancelledError`, and a path
-ending in `/add` without a `ret` in `!done` is a non-fatal
+runs one command and returns records in wire order with the final `!done`
+attributes, bounded by `MaxResultRecords` and `MaxResultBytes`; `!trap` becomes
+a `*routeros.TrapError` that carries those attributes, and a command whose
+result exceeds its limit while it is active, times out, or whose context ends
+sends `/cancel` and returns a `*routeros.ResourceLimitError`,
+`*routeros.TimeoutError`, or `*routeros.CancelledError`. A path ending in
+`/add` without a `ret` in `!done` is a non-fatal
 `*routeros.ProtocolError`. `Stream` receives ordered `!re` records through
 `Recv`, returns `io.EOF` for a normal `!done`, and uses bounded queues with TCP
 backpressure; cancelling its context or calling `Close` sends `/cancel`.
@@ -130,6 +132,9 @@ query words. Build query words with `Equal`, `LessThan`, `GreaterThan`,
 `Exists`, `Absent`, `Not`, `And`, and `Or`; arbitrary field names and values
 remain valid inputs. `Query` also accepts raw words beginning with `?` when a
 caller needs the RouterOS query language directly.
+
+`Do` retains its whole result only within `MaxResultRecords` and
+`MaxResultBytes`; use `Stream` for a long-running or unbounded command.
 
 ## Streams
 
@@ -263,6 +268,8 @@ Every limit has a safe default and may be lowered or raised explicitly.
 | `MaxWordBytes` | 32 MiB |
 | `MaxSentenceBytes` | 64 MiB |
 | `MaxWordsPerSentence` | 4096 |
+| `MaxResultRecords` | 1024 |
+| `MaxResultBytes` | 8 MiB |
 | `StreamMaxRecords` | 1024 |
 | `StreamMaxBytes` | 8 MiB |
 | `MaxBufferedStreamBytes` | 64 MiB |
