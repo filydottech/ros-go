@@ -40,8 +40,9 @@ type Config struct {
 	// Port is the API port. Zero selects 8729 with TLS and 8728 in plaintext.
 	Port int
 
-	// Username and Password authenticate the API user. Password is bytes so
-	// that the client does not keep a second copy as a string.
+	// Username and Password authenticate the API user. Dial and Reconnect copy
+	// Password for each attempt, clear their private copy, and never modify this
+	// caller-owned slice.
 	Username string
 	Password []byte
 
@@ -87,8 +88,16 @@ type Config struct {
 }
 
 // normalize returns a copy of c with defaults applied and every field
-// validated. The receiver is left untouched, including the caller's TLSConfig.
-func (c Config) normalize() (Config, error) {
+// validated. The receiver is left untouched, including the caller's TLSConfig
+// and password backing array.
+func (c Config) normalize() (normalized Config, err error) {
+	c.Password = append([]byte(nil), c.Password...)
+	defer func() {
+		if err != nil {
+			clear(c.Password)
+		}
+	}()
+
 	if c.Host == "" {
 		return Config{}, errors.New("host is required")
 	}
@@ -102,7 +111,6 @@ func (c Config) normalize() (Config, error) {
 		}
 	}
 
-	var err error
 	if c.ConnectTimeout, err = defaultDuration("connect timeout", c.ConnectTimeout, defaultConnectTimeout); err != nil {
 		return Config{}, err
 	}

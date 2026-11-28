@@ -82,15 +82,16 @@ type Client struct {
 // unencrypted connection, which then defaults to port 8728.
 //
 // Dial dials, completes the TLS handshake when TLS is enabled, then logs in
-// with one /login message. The password is not retained by the client after a
-// successful login. A failed dial returns a *ConnectionError; a login !trap
-// returns a *LoginError. A context that has already ended returns a
-// *CancelledError and sends nothing.
+// with one /login message. Each attempt clears its private password copy and
+// never modifies cfg.Password. A failed dial returns a *ConnectionError; a
+// login !trap returns a *LoginError. A context that has already ended returns
+// a *CancelledError and sends nothing.
 func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	cfg, err := cfg.normalize()
 	if err != nil {
 		return nil, &ConnectionError{Op: "dial", Err: err}
 	}
+	defer clear(cfg.Password)
 	if err := ctx.Err(); err != nil {
 		return nil, &CancelledError{Cause: err}
 	}
@@ -364,6 +365,7 @@ func (c *Client) Reconnect(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return &ConnectionError{Op: "reconnect", Err: err}
 	}
+	defer clear(cfg.Password)
 	if err := ctx.Err(); err != nil {
 		return &CancelledError{Cause: err}
 	}

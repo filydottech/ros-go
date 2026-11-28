@@ -1,6 +1,7 @@
 package routeros
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -280,6 +281,37 @@ func TestDialPlaintextUsesPlaintextPort(t *testing.T) {
 	}
 }
 
+func TestDialClearsOwnedPasswordAfterTransportFailure(t *testing.T) {
+	password := []byte(dialTestPassword)
+	caller := append([]byte(nil), password...)
+	var owned []byte
+
+	oldOpen := openTransport
+	openTransport = func(ctx context.Context, opts transport.Options) (*transport.Conn, error) {
+		owned = opts.Password
+		return nil, errors.New("test transport failure")
+	}
+	t.Cleanup(func() { openTransport = oldOpen })
+
+	_, err := Dial(context.Background(), Config{
+		Host:      "router.test",
+		Plaintext: true,
+		Username:  "alice",
+		Password:  password,
+	})
+	if err == nil {
+		t.Fatal("Dial() error = nil, want a transport failure")
+	}
+	if !bytes.Equal(password, caller) {
+		t.Fatal("Dial() modified the caller password")
+	}
+	for _, value := range owned {
+		if value != 0 {
+			t.Fatal("Dial() did not clear its password copy after a transport failure")
+		}
+	}
+}
+
 func TestDialLoginTrap(t *testing.T) {
 	pipeTransport(t, nil, func(conn net.Conn) {
 		decoder := wire.NewDecoder(wire.DefaultLimits())
@@ -297,11 +329,13 @@ func TestDialLoginTrap(t *testing.T) {
 		}
 	})
 
+	password := []byte(dialTestPassword)
+	caller := append([]byte(nil), password...)
 	_, err := Dial(context.Background(), Config{
 		Host:      "router.test",
 		Plaintext: true,
 		Username:  "alice",
-		Password:  []byte(dialTestPassword),
+		Password:  password,
 	})
 	var login *LoginError
 	if !errors.As(err, &login) {
@@ -312,6 +346,9 @@ func TestDialLoginTrap(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), dialTestPassword) {
 		t.Errorf("Dial() error = %q, must not contain the password", err)
+	}
+	if !bytes.Equal(password, caller) {
+		t.Error("Dial() modified the caller password after a login failure")
 	}
 }
 

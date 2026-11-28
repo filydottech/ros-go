@@ -1,6 +1,7 @@
 package routeros
 
 import (
+	"bytes"
 	"crypto/tls"
 	"strings"
 	"testing"
@@ -124,6 +125,23 @@ func TestNormalizeClonesTLSConfig(t *testing.T) {
 	}
 	if cfg.TLSConfig.MinVersion != tls.VersionTLS12 {
 		t.Errorf("TLSConfig.MinVersion = %d, want %d", cfg.TLSConfig.MinVersion, tls.VersionTLS12)
+	}
+}
+
+func TestNormalizeClonesPassword(t *testing.T) {
+	password := []byte("not-a-real-password")
+	caller := append([]byte(nil), password...)
+	cfg, err := Config{Host: "router.example.com", Password: password}.normalize()
+	if err != nil {
+		t.Fatalf("normalize() error = %v", err)
+	}
+	defer clear(cfg.Password)
+
+	if !bytes.Equal(cfg.Password, caller) {
+		t.Error("normalized password does not match the caller password")
+	}
+	if &cfg.Password[0] == &password[0] {
+		t.Error("normalize() reused the caller password backing array")
 	}
 }
 

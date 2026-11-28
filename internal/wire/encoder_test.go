@@ -36,6 +36,25 @@ func TestSentenceMeasuresUTF8BytesNotRunes(t *testing.T) {
 	}
 }
 
+func TestSentenceBytesPreservesUTF8Words(t *testing.T) {
+	password := []byte("not-a-real-password=café")
+	passwordWord := append([]byte("=password="), password...)
+	words := [][]byte{[]byte("/login"), passwordWord}
+
+	got, err := NewEncoder(DefaultLimits()).SentenceBytes(words)
+	if err != nil {
+		t.Fatalf("SentenceBytes() error = %v", err)
+	}
+	want := AppendLength(nil, uint32(len(words[0])))
+	want = append(want, words[0]...)
+	want = AppendLength(want, uint32(len(words[1])))
+	want = append(want, words[1]...)
+	want = append(want, 0)
+	if !bytes.Equal(got, want) {
+		t.Errorf("SentenceBytes() = % x, want % x", got, want)
+	}
+}
+
 func TestSentenceRejectsEmptyInput(t *testing.T) {
 	encoder := NewEncoder(DefaultLimits())
 	if _, err := encoder.Sentence(nil); err == nil {
@@ -71,6 +90,17 @@ func TestAppendSentenceLeavesDstUnchangedOnError(t *testing.T) {
 	}
 	if string(got) != "prefix" {
 		t.Errorf("AppendSentence() = %q, want %q", got, "prefix")
+	}
+}
+
+func TestAppendSentenceBytesLeavesDstUnchangedOnError(t *testing.T) {
+	dst := []byte("prefix")
+	got, err := NewEncoder(DefaultLimits()).AppendSentenceBytes(dst, [][]byte{[]byte("!done"), nil})
+	if err == nil {
+		t.Fatal("AppendSentenceBytes() error = nil, want a rejection")
+	}
+	if string(got) != "prefix" {
+		t.Errorf("AppendSentenceBytes() = %q, want %q", got, "prefix")
 	}
 }
 

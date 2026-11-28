@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -26,6 +27,18 @@ type loginReadBlockConn struct {
 	readOnce        sync.Once
 	deadlineOnce    sync.Once
 	releaseOnce     sync.Once
+}
+
+type loginReadSignalConn struct {
+	net.Conn
+
+	readStarted chan struct{}
+	readOnce    sync.Once
+}
+
+func (c *loginReadSignalConn) Read(b []byte) (int, error) {
+	c.readOnce.Do(func() { close(c.readStarted) })
+	return c.Conn.Read(b)
 }
 
 func newLoginReadBlockConn() *loginReadBlockConn {
@@ -238,6 +251,91 @@ func openConn(t *testing.T, script func(*fakeServer)) *Conn {
 	return conn
 }
 
+func TestOpenClearsPasswordAfterDialFailure(t *testing.T) {
+	password := []byte(testPassword)
+	_, err := Open(context.Background(), Options{
+		Password: password,
+		Dial: func(context.Context, string) (net.Conn, error) {
+			return nil, errors.New("test dial failure")
+		},
+	})
+	if err == nil {
+		t.Fatal("Open() error = nil, want a dial failure")
+	}
+	for _, value := range password {
+		if value != 0 {
+			t.Fatal("Open() did not clear the password after a dial failure")
+		}
+	}
+}
+
+func TestOpenClearsPasswordAfterLogin(t *testing.T) {
+	password := []byte(testPassword)
+	opts := newOptions(t, func(s *fakeServer) {
+		s.login()
+		s.drain()
+	})
+	opts.Password = password
+
+	conn, err := Open(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	for _, value := range password {
+		if value != 0 {
+			t.Fatal("Open() did not clear the password after login")
+		}
+	}
+}
+
+func TestLoginClearsPasswordAfterWrite(t *testing.T) {
+	password := []byte(testPassword)
+	written := make(chan struct{})
+	reply := make(chan struct{})
+	readStarted := make(chan struct{})
+	opts := newOptions(t, func(s *fakeServer) {
+		s.next()
+		close(written)
+		<-reply
+		s.send("!done")
+		s.drain()
+	})
+	opts.Password = password
+	dial := opts.Dial
+	opts.Dial = func(ctx context.Context, address string) (net.Conn, error) {
+		conn, err := dial(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		return &loginReadSignalConn{Conn: conn, readStarted: readStarted}, nil
+	}
+
+	type result struct {
+		conn *Conn
+		err  error
+	}
+	returned := make(chan result, 1)
+	go func() {
+		conn, err := Open(context.Background(), opts)
+		returned <- result{conn: conn, err: err}
+	}()
+
+	<-written
+	<-readStarted
+	for _, value := range password {
+		if value != 0 {
+			t.Fatal("login did not clear the password after writing it")
+		}
+	}
+	close(reply)
+	got := <-returned
+	if got.err != nil {
+		t.Fatalf("Open() error = %v", got.err)
+	}
+	_ = got.conn.Close()
+}
+
 func tagOf(t *testing.T, words []string) string {
 	t.Helper()
 	for _, word := range words {
@@ -293,6 +391,26 @@ func TestLoginSendsNameAndPasswordInOneSentence(t *testing.T) {
 	if err := conn.Err(); err != nil {
 		t.Fatalf("Err() = %v, want nil", err)
 	}
+}
+
+func TestLoginPreservesUTF8PasswordBytes(t *testing.T) {
+	password := []byte("not-a-real-password=café")
+	want := append([]byte("=password="), password...)
+	t.Cleanup(func() { clear(want) })
+	opts := newOptions(t, func(s *fakeServer) {
+		words := s.login()
+		if !bytes.Equal([]byte(words[2]), want) {
+			t.Error("login password word did not preserve its UTF-8 bytes")
+		}
+		s.drain()
+	})
+	opts.Password = password
+
+	conn, err := Open(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
 }
 
 func TestLoginCancellationInterruptsPendingRead(t *testing.T) {

@@ -20,12 +20,27 @@ func NewEncoder(limits Limits) *Encoder {
 // words than MaxWordsPerSentence, and a payload sum above MaxSentenceBytes are
 // rejected; the encoder never writes a partial sentence.
 func (e *Encoder) Sentence(words []string) ([]byte, error) {
-	return e.AppendSentence(nil, words)
+	return appendSentence(e, nil, words)
 }
 
 // AppendSentence appends one complete sentence to dst. On error dst is
 // returned unchanged.
 func (e *Encoder) AppendSentence(dst []byte, words []string) ([]byte, error) {
+	return appendSentence(e, dst, words)
+}
+
+// SentenceBytes encodes byte words without converting them to strings.
+func (e *Encoder) SentenceBytes(words [][]byte) ([]byte, error) {
+	return appendSentence(e, nil, words)
+}
+
+// AppendSentenceBytes appends one complete byte-word sentence to dst. On
+// error dst is returned unchanged.
+func (e *Encoder) AppendSentenceBytes(dst []byte, words [][]byte) ([]byte, error) {
+	return appendSentence(e, dst, words)
+}
+
+func appendSentence[T string | []byte](e *Encoder, dst []byte, words []T) ([]byte, error) {
 	if len(words) == 0 {
 		return dst, &ProtocolError{Detail: "sentence has no words"}
 	}
@@ -39,7 +54,7 @@ func (e *Encoder) AppendSentence(dst []byte, words []string) ([]byte, error) {
 	start := len(dst)
 	total := int64(0)
 	for _, word := range words {
-		if word == "" {
+		if len(word) == 0 {
 			return dst[:start], &ProtocolError{Detail: "sentence contains an empty word"}
 		}
 		if int64(len(word)) > int64(e.limits.MaxWordBytes) {
@@ -58,7 +73,17 @@ func (e *Encoder) AppendSentence(dst []byte, words []string) ([]byte, error) {
 			}
 		}
 		dst = AppendLength(dst, uint32(len(word)))
-		dst = append(dst, word...)
+		dst = appendSentenceWord(dst, word)
 	}
 	return append(dst, 0), nil
+}
+
+func appendSentenceWord[T string | []byte](dst []byte, word T) []byte {
+	switch value := any(word).(type) {
+	case string:
+		return append(dst, value...)
+	case []byte:
+		return append(dst, value...)
+	}
+	panic("wire: unsupported sentence word type")
 }

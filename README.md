@@ -257,7 +257,10 @@ func main() {}
   `Host` when empty. The caller's config is not modified.
 - `InsecureSkipVerify` is possible only when the caller supplies it in
   `TLSConfig`; it is a testing mode, not a fallback.
-- Passwords are held as `[]byte` and are never written to a log or an error.
+- Each connection attempt uses a private copy of `Config.Password`, clears that
+  copy when the attempt ends, and never modifies the caller's slice. This is
+  best effort: Go runtime, TLS, and kernel copies are outside the client's
+  control. Passwords are never written to a log or an error.
 
 ## Limits
 

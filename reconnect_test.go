@@ -1,6 +1,7 @@
 package routeros
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -13,6 +14,15 @@ import (
 )
 
 func dialWithTransportScripts(t *testing.T, scripts ...func(*sentenceReader)) *Client {
+	return dialWithConfigAndTransportScripts(t, Config{
+		Host:      "router.test",
+		Plaintext: true,
+		Username:  "alice",
+		Password:  []byte(dialTestPassword),
+	}, scripts...)
+}
+
+func dialWithConfigAndTransportScripts(t *testing.T, cfg Config, scripts ...func(*sentenceReader)) *Client {
 	t.Helper()
 
 	oldOpen := openTransport
@@ -66,17 +76,34 @@ func dialWithTransportScripts(t *testing.T, scripts ...func(*sentenceReader)) *C
 		}
 	})
 
-	client, err := Dial(context.Background(), Config{
-		Host:      "router.test",
-		Plaintext: true,
-		Username:  "alice",
-		Password:  []byte(dialTestPassword),
-	})
+	client, err := Dial(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Dial() error = %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+func TestPasswordConfigCanBeReusedForDialAndReconnect(t *testing.T) {
+	password := []byte(dialTestPassword)
+	caller := append([]byte(nil), password...)
+	cfg := Config{
+		Host:      "router.test",
+		Plaintext: true,
+		Username:  "alice",
+		Password:  password,
+	}
+	client := dialWithConfigAndTransportScripts(t, cfg,
+		func(r *sentenceReader) { r.drain() },
+		func(r *sentenceReader) { r.drain() },
+	)
+
+	if err := client.Reconnect(context.Background(), cfg); err != nil {
+		t.Fatalf("Reconnect() error = %v", err)
+	}
+	if !bytes.Equal(cfg.Password, caller) {
+		t.Error("Dial() or Reconnect() modified the caller password")
+	}
 }
 
 func TestReconnectReplacesGenerationAndResetsTags(t *testing.T) {
@@ -345,16 +372,22 @@ func TestReconnectUsesTheNewConfigAndDiscardsItsPassword(t *testing.T) {
 	var got transport.Options
 	openTransport = func(ctx context.Context, opts transport.Options) (*transport.Conn, error) {
 		got = opts
+		got.Password = append([]byte(nil), opts.Password...)
 		return underlying(ctx, opts)
 	}
-	t.Cleanup(func() { openTransport = underlying })
+	t.Cleanup(func() {
+		clear(got.Password)
+		openTransport = underlying
+	})
 
+	password := []byte(dialTestPassword)
+	caller := append([]byte(nil), password...)
 	cfg := Config{
 		Host:      "replacement.test",
 		Port:      12345,
 		Plaintext: true,
 		Username:  "bob",
-		Password:  []byte(dialTestPassword),
+		Password:  password,
 	}
 	if err := client.Reconnect(context.Background(), cfg); err != nil {
 		t.Fatalf("Reconnect() error = %v", err)
@@ -370,6 +403,9 @@ func TestReconnectUsesTheNewConfigAndDiscardsItsPassword(t *testing.T) {
 	}
 	if client.cfg.Password != nil {
 		t.Error("client retained the reconnect password after login")
+	}
+	if !bytes.Equal(cfg.Password, caller) {
+		t.Error("Reconnect() modified the caller password")
 	}
 }
 

@@ -59,8 +59,8 @@ type Options struct {
 	Address string
 	// TLSConfig enables TLS when non-nil. Its ServerName must be set.
 	TLSConfig *tls.Config
-	// Username and Password are sent by the one-message login. Password is
-	// only referenced during Open.
+	// Username and Password are sent by the one-message login. Open clears its
+	// password buffer before it returns.
 	Username string
 	Password []byte
 	// ConnectTimeout bounds dialling, the TLS handshake, and login.
@@ -212,6 +212,8 @@ type Conn struct {
 // reader and writer goroutines. A returned error means no connection is left
 // open.
 func Open(ctx context.Context, opts Options) (*Conn, error) {
+	defer clear(opts.Password)
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -834,16 +836,25 @@ func login(ctx context.Context, conn net.Conn, opts Options) error {
 		return err
 	}
 
-	sentence, err := wire.NewEncoder(opts.Limits).Sentence([]string{
-		"/login",
-		"=name=" + opts.Username,
-		"=password=" + string(opts.Password),
+	defer clear(opts.Password)
+
+	passwordWord := make([]byte, len("=password=")+len(opts.Password))
+	copy(passwordWord, "=password=")
+	copy(passwordWord[len("=password="):], opts.Password)
+	sentence, err := wire.NewEncoder(opts.Limits).SentenceBytes([][]byte{
+		[]byte("/login"),
+		[]byte("=name=" + opts.Username),
+		passwordWord,
 	})
+	clear(passwordWord)
 	if err != nil {
 		return err
 	}
-	if err := writeFull(conn, sentence); err != nil {
-		return fmt.Errorf("transport: write login: %w", err)
+	writeErr := writeFull(conn, sentence)
+	clear(sentence)
+	clear(opts.Password)
+	if writeErr != nil {
+		return fmt.Errorf("transport: write login: %w", writeErr)
 	}
 
 	decoder := wire.NewDecoder(opts.Limits)
