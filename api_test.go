@@ -67,3 +67,10 @@ func TestDialReportsAnEndedContext(t *testing.T) {
 		t.Errorf("errors.Is(Dial() error, context.Canceled) = false, want true")
 	}
 }
+
+func TestConfigExposesResultLimits(t *testing.T) {
+	cfg := routeros.Config{MaxResultRecords: 1, MaxResultBytes: 2}
+	if cfg.MaxResultRecords != 1 || cfg.MaxResultBytes != 2 {
+		t.Errorf("Config result limits = records %d, bytes %d; want records 1 and bytes 2", cfg.MaxResultRecords, cfg.MaxResultBytes)
+	}
+}

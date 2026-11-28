@@ -64,6 +64,16 @@ type Reply struct {
 	FatalReason string
 }
 
+// ReplyAttributeBytes reports the payload size of reply attributes. It omits
+// framing, reply words, API attributes, and Go allocation overhead.
+func ReplyAttributeBytes(reply Reply) int {
+	bytes := 0
+	for name, value := range reply.Attributes {
+		bytes += len(name) + len(value)
+	}
+	return bytes
+}
+
 // ParseReply parses one sentence. Only the five reply words are accepted; any
 // other first word is a *ProtocolError.
 func ParseReply(words []string) (Reply, error) {

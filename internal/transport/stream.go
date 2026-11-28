@@ -120,9 +120,5 @@ func (q *streamQueue) isDrainedLocked() bool {
 }
 
 func streamReplyBytes(reply wire.Reply) int {
-	bytes := 0
-	for name, value := range reply.Attributes {
-		bytes += len(name) + len(value)
-	}
-	return bytes
+	return wire.ReplyAttributeBytes(reply)
 }

@@ -115,14 +115,16 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	return client, nil
 }
 
-// Do sends one command and returns every !re record in arrival order together
-// with the final !done attributes.
+// Do sends one command and returns !re records in arrival order together with
+// the final !done attributes, bounded by Config.MaxResultRecords and
+// Config.MaxResultBytes.
 //
 // The context owns the command lifecycle: one that has ended before the write
 // sends nothing, and one that ends after the write starts remote cancellation
 // but returns a *CancelledError without waiting for the router. A command that
 // exceeds Config.CommandTimeout starts the same cancellation and returns a
-// *TimeoutError.
+// *TimeoutError. A result that exceeds either result limit starts cancellation
+// and returns a *ResourceLimitError.
 //
 // A !trap is reported as a *TrapError that carries the !done attributes. A path
 // ending in /add without a ret attribute in !done is a *ProtocolError for that
@@ -140,6 +142,8 @@ func (c *Client) Do(ctx context.Context, path string, req Request) (Result, erro
 	reconnecting := c.reconnecting
 	terminal := c.err
 	timeout := c.cfg.CommandTimeout
+	maxResultRecords := c.cfg.MaxResultRecords
+	maxResultBytes := c.cfg.MaxResultBytes
 	c.mu.Unlock()
 
 	if closed {
@@ -167,7 +171,7 @@ func (c *Client) Do(ctx context.Context, path string, req Request) (Result, erro
 	case writeErr := <-pending.Written():
 		if writeErr != nil {
 			<-pending.Done()
-			return finishCommand(path, pending, nil, timeout)
+			return finishCommand(path, pending, &resultCollector{maxRecords: maxResultRecords, maxBytes: maxResultBytes}, timeout)
 		}
 	case <-ctx.Done():
 		conn.Cancel(pending, ctx.Err())
@@ -175,19 +179,22 @@ func (c *Client) Do(ctx context.Context, path string, req Request) (Result, erro
 	case <-pending.Done():
 		// The reply can beat the write acknowledgement on a fast link, so a
 		// finished request is completed rather than treated as a write failure.
-		return finishCommand(path, pending, nil, timeout)
+		return finishCommand(path, pending, &resultCollector{maxRecords: maxResultRecords, maxBytes: maxResultBytes}, timeout)
 	}
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	var records []Record
+	results := resultCollector{maxRecords: maxResultRecords, maxBytes: maxResultBytes}
 	for {
 		select {
 		case reply := <-pending.Replies():
-			records = append(records, Record(reply.Attributes))
+			if err := results.append(reply); err != nil {
+				conn.Cancel(pending, err)
+				return Result{}, err
+			}
 		case <-pending.Done():
-			return finishCommand(path, pending, records, timeout)
+			return finishCommand(path, pending, &results, timeout)
 		case <-ctx.Done():
 			conn.Cancel(pending, ctx.Err())
 			return Result{}, &CancelledError{Cause: ctx.Err()}
@@ -202,14 +209,16 @@ func (c *Client) Do(ctx context.Context, path string, req Request) (Result, erro
 // finishCommand turns a resolved pending request into a Result or its typed
 // error. It runs after Done closes, when the retained trap and done replies and
 // the resolution error are stable.
-func finishCommand(path string, pending *transport.Pending, records []Record, timeout time.Duration) (Result, error) {
+func finishCommand(path string, pending *transport.Pending, results *resultCollector, timeout time.Duration) (Result, error) {
 	// Every record queued before the terminal reply belongs to the result, even
 	// when the terminal reply arrived before the caller started reading.
 drain:
 	for {
 		select {
 		case reply := <-pending.Replies():
-			records = append(records, Record(reply.Attributes))
+			if err := results.append(reply); err != nil {
+				return Result{}, err
+			}
 		default:
 			break drain
 		}
@@ -235,7 +244,35 @@ drain:
 			return Result{}, &ProtocolError{Detail: path + " reply has no ret attribute"}
 		}
 	}
-	return Result{Records: records, Done: done}, nil
+	return Result{Records: results.records, Done: done}, nil
+}
+
+type resultCollector struct {
+	records    []Record
+	maxRecords int
+	bytes      int64
+	maxBytes   int
+}
+
+func (c *resultCollector) append(reply wire.Reply) error {
+	if len(c.records) >= c.maxRecords {
+		return &ResourceLimitError{
+			Scope:    "result records",
+			Limit:    int64(c.maxRecords),
+			Observed: int64(len(c.records) + 1),
+		}
+	}
+	bytes := int64(wire.ReplyAttributeBytes(reply))
+	if c.bytes+bytes > int64(c.maxBytes) {
+		return &ResourceLimitError{
+			Scope:    "result bytes",
+			Limit:    int64(c.maxBytes),
+			Observed: c.bytes + bytes,
+		}
+	}
+	c.records = append(c.records, Record(reply.Attributes))
+	c.bytes += bytes
+	return nil
 }
 
 // Stream sends one command and returns a bounded stream of !re records.
