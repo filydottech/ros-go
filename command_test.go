@@ -263,10 +263,14 @@ func TestDoAppliesDefaultResultRecordLimit(t *testing.T) {
 }
 
 func TestDoReturnsResourceLimitAtResultByteLimit(t *testing.T) {
+	releaseDone := make(chan struct{})
+	doneSent := make(chan struct{})
 	client := dialPlain(t, Config{MaxResultRecords: 10, MaxResultBytes: 5}, func(r *sentenceReader) {
 		tag := r.tag(r.next())
 		r.send("!re", "=name=xx", ".tag="+tag)
+		<-releaseDone
 		r.send("!done", ".tag="+tag)
+		close(doneSent)
 		r.drain()
 	})
 
@@ -281,6 +285,8 @@ func TestDoReturnsResourceLimitAtResultByteLimit(t *testing.T) {
 	if limit.Limit != 5 || limit.Observed != 6 {
 		t.Errorf("limit = %+v, want limit 5 and observed 6", limit)
 	}
+	close(releaseDone)
+	<-doneSent
 }
 
 func TestDoReportsTrapWithDoneAttributes(t *testing.T) {
